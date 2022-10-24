@@ -59,9 +59,6 @@ var (
 	}
 )
 
-// TODO: rename ServerPublicKey to 'dhKey' or 'tmpKey' - to avoid confusion
-// with the VAPID ServerPublicKey
-
 // EncryptionContext stores the source and result of encrypting a message. The ciphertext is
 // the actual encrypted message, while the salt and server public key are
 // required to be sent to the client so that the message can be decrypted.
@@ -70,7 +67,7 @@ type EncryptionContext struct {
 	// Format:
 	// 16 B Salt
 	// 4B rs {0,0, 16, 0} - 4k
-	// 1B ID-Size {65}
+	// 1B WorkloadID-Size {65}
 	// 65B SendPublicKey
 	// Up to 4k encrypted text - with 0x02 appended at the end before encryption
 	// Wasted: 7 const.
@@ -102,6 +99,7 @@ type EncryptionContext struct {
 
 const debugEncrypt = false
 
+// NewContextSend creates a new encryption context for sending, based on the subscription pub key and auth.
 func NewContextSend(uapub, auth []byte) *EncryptionContext {
 	return &EncryptionContext{
 		Auth:     auth,
@@ -109,7 +107,7 @@ func NewContextSend(uapub, auth []byte) *EncryptionContext {
 	}
 }
 
-// Deprecated, test only
+// NewContextUA creates a context for decrypting message by a UA.
 func NewContextUA(uapriv, uapub, auth []byte) *EncryptionContext {
 	return &EncryptionContext{
 		Auth:      auth,

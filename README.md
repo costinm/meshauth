@@ -1,6 +1,7 @@
 # Minimal auth library for certs and tokens
 
-The code is in large part based on/forked from Istio, to remove dependencies.
+The code is in large part based on/forked from Istio and few of my projects, to remove dependencies and keep a minimal
+package for native mesh integration.
 
 ## Certificates
 
@@ -13,6 +14,20 @@ code, similar to Citadel.
 This library includes very minimal code to parse/verify JWT and extract info.
 It is not complete or intended as a general library - just as a minimal one,
 focused for the tokens used in K8S/Istio.
+
+## Provisioning and bootstraping
+
+Mesh auth provisioning involves configuring a core set of options:
+- mesh and k8s root certificates 
+- private key or JWT
+- a set of trusted servers for CA, XDS and further configuration.
+
+The certs/JWT also include identity information that can be extracted - trust domain, namespace, etc.
+
+## Webpush
+
+This package also include the basic primitives for using Webpush - crypto and VAPID. While webpush is primarily 
+used for push messages to browsers, it is a very interesting mechanism for mesh config and events.
 
 ## STS
 

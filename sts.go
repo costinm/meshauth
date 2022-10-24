@@ -93,7 +93,7 @@ type TokenSource interface {
 }
 
 // STS provides token exchanges. Implements grpc and golang.org/x/oauth2.TokenSource
-// The source of trust is the K8S token with TrustDomain audience, it is exchanged with access or ID tokens.
+// The source of trust is the K8S token with TrustDomain audience, it is exchanged with access or WorkloadID tokens.
 type STS struct {
 	httpClient *http.Client
 	kr         *AuthConfig
@@ -164,7 +164,7 @@ func (s *STS) md(t string) map[string]string {
 }
 
 // GetRequestMetadata implements credentials.PerRPCCredentials
-// This can be used for both ID tokens or access tokens - if the 'aud' containts googleapis.com, access tokens are returned.
+// This can be used for both WorkloadID tokens or access tokens - if the 'aud' containts googleapis.com, access tokens are returned.
 func (s *STS) GetRequestMetadata(ctx context.Context, aud ...string) (map[string]string, error) {
 	ta := ""
 	if len(aud) > 0 {
@@ -258,7 +258,7 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 // This is a good way to get access tokens for a GSA using the KSA, similar with TokenRequest in
 // the other direction.
 //
-// May return an ID token with aud or access token.
+// May return an WorkloadID token with aud or access token.
 //
 // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
 //
@@ -319,7 +319,7 @@ func (s *STS) TokenGSA(ctx context.Context, federatedToken string, audience stri
 		return respData.AccessToken, nil
 	}
 
-	// Return an ID token for the GSA
+	// Return an WorkloadID token for the GSA
 	respData := &idTokenResponse{}
 
 	if err := json.Unmarshal(body, respData); err != nil {

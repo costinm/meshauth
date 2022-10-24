@@ -68,6 +68,7 @@ func SubscriptionFromJSON(b []byte) (*Subscription, error) {
 	return &Subscription{sub.Endpoint, key, auth, ""}, nil
 }
 
+// Verify checks the data is signed with the public key
 func Verify(data []byte, pub []byte, sig []byte) error {
 	hasher := crypto.SHA256.New()
 	hasher.Write(data) //[0:64]) // only public key, for debug

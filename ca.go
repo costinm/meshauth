@@ -10,8 +10,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io/ioutil"
 	"math/big"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,6 +23,7 @@ const (
 	blockTypeECPrivateKey    = "EC PRIVATE KEY"
 	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#1 private key
 	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
+	blockTypeCertificate     = "CERTIFICATE"
 )
 
 // CA is used as an internal CA, mainly for testing and provisioning.
@@ -39,52 +43,92 @@ type CA struct {
 	CACert      *x509.Certificate
 	TrustDomain string
 	prefix      string
+	CACertPEM   []byte
 }
 
+// NewCA creates a new CA and loads the certificates.
 func NewCA(trust string) *CA {
 	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, _ := rootCert(trust, "rootCA", ca, ca)
-	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
+	if trust == "" {
+		trust = "cluster.local"
+	}
+	caCert, caCertPEM := rootCert(trust, "rootCA", ca, ca)
+	return &CA{Private: ca, CACert: caCert, CACertPEM: caCertPEM, TrustDomain: trust,
 		prefix: "spiffe://" + trust + "/ns/",
 	}
+}
+
+func CAFromEnv(dir string) *CA {
+	trust := os.Getenv("TRUST_DOMAIN")
+	if trust == "" {
+		trust = "cluster.local"
+	}
+	ca := &CA{TrustDomain: trust, prefix: "spiffe://" + trust + "/ns/"}
+	ca.load(dir)
+	if ca.Private != nil {
+		return ca
+	}
+
+	cak, _ := rsa.GenerateKey(rand.Reader, 2048)
+	caCert, caCertPEM := rootCert(trust, "rootCA", cak, cak)
+	ca.Private = cak
+	ca.CACertPEM = caCertPEM
+	ca.CACert = caCert
+
+	ca.Save(dir)
+	return ca
+}
+
+// In istio -istio-ca-secret in istio-system
+const keyFile = "ca-key.pem"
+const chainFile = "ca-cert.pem"
+
+func (ca *CA) load(dir string) {
+	privPEM, err := ioutil.ReadFile(filepath.Join(dir, keyFile))
+	if err != nil {
+		return
+	}
+	certPEM, err := ioutil.ReadFile(filepath.Join(dir, chainFile))
+	if err != nil {
+		return
+	}
+
+	kp, err := tls.X509KeyPair(certPEM, privPEM)
+	kp.Leaf, _ = x509.ParseCertificate(kp.Certificate[0])
+	ca.CACertPEM = ca.CACertPEM
+	ca.CACert = kp.Leaf
 }
 
 func (ca *CA) NewIntermediaryCA(trust string) *CA {
 	cak, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, _ := rootCert(trust, "rootCA", cak, ca.Private)
-	return &CA{Private: cak, CACert: caCert, TrustDomain: trust,
-		prefix: "spiffe://" + trust + "/ns/",
-	}
-}
-
-func LoadCADir(dir, trust string) *CA {
-	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, _ := rootCert(trust, "rootCA", ca, ca)
-	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
-		prefix: "spiffe://" + trust + "/ns/",
-	}
-}
-
-func LoadCAPEM(keyPEM, certPEM, trust string) *CA {
-	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, _ := rootCert(trust, "rootCA", ca, ca)
-	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
-		prefix: "spiffe://" + trust + "/ns/",
+	caCert, caCertPEM := rootCert(trust, "rootCA", cak, ca.Private)
+	return &CA{Private: cak, CACert: caCert, CACertPEM: caCertPEM,
+		TrustDomain: trust,
+		prefix:      "spiffe://" + trust + "/ns/",
 	}
 }
 
 func (ca *CA) NewID(ns, sa string) *MeshAuth {
-	caCert := ca.CACert
 	crt := ca.NewTLSCert(ns, sa)
 
 	nodeID := NewMeshAuth()
-	nodeID.TrustedCertPool.AddCert(caCert)
+	nodeID.AddRoots(ca.CACertPEM)
 	nodeID.SetTLSCertificate(crt)
 
 	return nodeID
 }
 
-func (ca *CA) Save(outDir string) error {
+func (ca *CA) Save(dir string) error {
+	p := MarshalPrivateKey(ca.Private)
+
+	err := ioutil.WriteFile(filepath.Join(dir, keyFile), p, 0660)
+	if err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(filepath.Join(dir, chainFile), ca.CACertPEM, 0660)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -235,8 +279,13 @@ func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x5
 	if err != nil {
 		panic(err)
 	}
-	rootCA, _ := x509.ParseCertificates(certDER)
-	return rootCA[0], certDER
+	rootCA, err := x509.ParseCertificates(certDER)
+	if err != nil {
+		panic(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypeCertificate, Bytes: certDER})
+
+	return rootCA[0], certPEM
 }
 
 func newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*tls.Certificate, []byte, []byte) {
@@ -245,14 +294,15 @@ func newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca cry
 	if err != nil {
 		return nil, nil, nil
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypeCertificate, Bytes: certDER})
 
 	ecb, _ := x509.MarshalPKCS8PrivateKey(priv)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: ecb})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypePKCS8PrivateKey, Bytes: ecb})
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, nil, nil
 	}
+
 	return &tlsCert, keyPEM, certPEM
 }

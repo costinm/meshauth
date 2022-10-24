@@ -98,6 +98,7 @@ func TokenPayload(jwt string) string {
 	return string(payloadBytes)
 }
 
+// DecodeJWT decodes the content of a token. No signature checks.
 func DecodeJWT(jwt string) *JWT {
 	payload := TokenPayload(jwt)
 	j := &JWT{}

@@ -48,7 +48,7 @@ type JWTHead struct {
 }
 
 // VAPIDToken creates a token with the specified endpoint, using configured Sub id
-// and a default expiration (1h).
+// and a default expiration (1h). The identity must be based on EC256.
 //
 // Format is "vapid t=TOKEN k=PUBKEY
 //
@@ -124,7 +124,7 @@ func (auth *MeshAuth) rawVAPIDSign(t []byte) string {
 	token = append(token, dot...)
 	token = append(token, sigB64...)
 
-	return "vapid t=" + string(token) + ", k=" + auth.pub64
+	return "vapid t=" + string(token) + ", k=" + auth.PublicKeyBase64
 }
 
 func JwtRawParse(tok string) (*JWTHead, *JWT, []byte, []byte, error) {
