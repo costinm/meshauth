@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -95,7 +96,7 @@ func (ca *CA) load(dir string) {
 
 	kp, err := tls.X509KeyPair(certPEM, privPEM)
 	kp.Leaf, _ = x509.ParseCertificate(kp.Certificate[0])
-	ca.CACertPEM = ca.CACertPEM
+	ca.CACertPEM = certPEM
 	ca.CACert = kp.Leaf
 }
 
@@ -111,7 +112,7 @@ func (ca *CA) NewIntermediaryCA(trust string) *CA {
 func (ca *CA) NewID(ns, sa string) *MeshAuth {
 	crt := ca.NewTLSCert(ns, sa)
 
-	nodeID := NewMeshAuth()
+	nodeID := NewMeshAuth(nil)
 	nodeID.AddRoots(ca.CACertPEM)
 	nodeID.SetTLSCertificate(crt)
 
@@ -142,7 +143,8 @@ func (ca *CA) NewTLSCert(ns, sa string) *tls.Certificate {
 func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
 	var priv crypto.PrivateKey
 
-	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	rsaKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// rsa.GenerateKey(rand.Reader, 2048)
 	priv = rsaKey
 
 	csr := GenCSRTemplate(a.TrustDomain, san)

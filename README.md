@@ -5,7 +5,7 @@ package for native mesh integration.
 
 ## Certificates
 
-Code to lookup certificates in the locations used in Istio/GKE and 
+Code to lookup certificates in the locations used in Istio/GKE and
 generate certs for self-signed or testing. Includes the minimal CA
 code, similar to Citadel.
 
@@ -18,7 +18,8 @@ focused for the tokens used in K8S/Istio.
 ## Provisioning and bootstraping
 
 Mesh auth provisioning involves configuring a core set of options:
-- mesh and k8s root certificates 
+
+- mesh and k8s root certificates
 - private key or JWT
 - a set of trusted servers for CA, XDS and further configuration.
 
@@ -26,7 +27,7 @@ The certs/JWT also include identity information that can be extracted - trust do
 
 ## Webpush
 
-This package also include the basic primitives for using Webpush - crypto and VAPID. While webpush is primarily 
+This package also include the basic primitives for using Webpush - crypto and VAPID. While webpush is primarily
 used for push messages to browsers, it is a very interesting mechanism for mesh config and events.
 
 ## STS

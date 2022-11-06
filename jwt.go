@@ -41,7 +41,7 @@ type JWT struct {
 
 	Name string `json:"kubernetes.io/serviceaccount/service-account.name"`
 
-	Raw string `json:-`
+	Raw string `json:"-"`
 }
 
 type K8SAccountInfo struct {
