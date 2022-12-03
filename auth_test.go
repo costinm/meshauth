@@ -35,7 +35,7 @@ func TestVapid(t *testing.T) {
 	}
 	log.Println(len(rfcP), rfcT)
 
-	alice := NewAuth(&MeshAuthCfg{TrustDomain: "test.sender"})
+	alice := NewMeshAuth(&MeshAuthCfg{TrustDomain: "test.sender"}).InitSelfSigned("")
 	bobToken := alice.VAPIDToken("bob")
 	log.Println("Authorization: " + bobToken)
 

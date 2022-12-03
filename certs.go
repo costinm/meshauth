@@ -129,7 +129,7 @@ type MeshAuth struct {
 // Must call SetTLSCertificate to initialize or one of the methods that finds or generates the cert.
 func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 	if cfg == nil {
-		cfg = &MeshAuthCfg{}
+		cfg = &MeshAuthCfg{TrustDomain: "cluster.local"}
 	}
 	a := &MeshAuth{
 		trustedCertPool: x509.NewCertPool(),
@@ -140,17 +140,28 @@ func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 }
 
 // FromEnv will attempt to identify and load the certificates.
+// This should be called from main() and for normal app use.
+//
+// NewMeshAuth can be used in tests or for fine control over
+// what cert is loaded.
+//
 // - default GKE/Istio location for workload identity
 // - /var/run/secrets/...FindC
 // - /etc/istio/certs
 // - $HOME/
+//
+// If a cert is found, the identity is extracted from the cert. The
+// platform is expected to refresh the cert.
+//
+// If a cert is not found, Cert field will be nil, and the app should
+// use one of the methods of getting a cert or call InitSelfSigned.
 func FromEnv(cfg *MeshAuthCfg) (*MeshAuth, error) {
+	a := NewMeshAuth(cfg)
 	if cfg == nil {
-		cfg = &MeshAuthCfg{}
+		cfg = a.MeshAuthCfg
 	}
 
-	a := NewMeshAuth(cfg)
-
+	// Attempt to locate the cert dir.
 	if cfg.CertDir == "" {
 		// Try to find the certificate directory
 		if _, err := os.Stat(filepath.Join("./", "key.pem")); !os.IsNotExist(err) {
@@ -200,23 +211,6 @@ func (v *MeshAuth) SetVapid(publicKey64, privateKey64 string) {
 	tlsCert, _, _ := v.generateSelfSigned("ec256", &pkey, "TODO")
 
 	v.SetTLSCertificate(&tlsCert)
-
-}
-
-// NewAuth creates an MeshAuth using the config, generating a self signed cert if a cert is not
-// specified.
-func NewAuth(cfg *MeshAuthCfg) *MeshAuth {
-	if cfg == nil {
-		cfg = &MeshAuthCfg{
-			TrustDomain: "cluster.local",
-		}
-	}
-
-	auth := NewMeshAuth(cfg)
-
-	auth.InitSelfSigned("")
-
-	return auth
 }
 
 // initFromCert initializes the MeshTLSConfig with the workload certificate
@@ -260,9 +254,9 @@ func (a *MeshAuth) initFromCert() {
 // InitSelfSigned will load a cert from env, and if not found create a new self-signed cert.
 // Defaults to ec256.
 // Will init the Cert, PubID, PublicKey fields - private is in Cert.
-func (auth *MeshAuth) InitSelfSigned(kty string) {
+func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 	if auth.Cert != nil {
-		return // got a cert
+		return auth // got a cert
 	}
 	//var keyPEM, certPEM []byte
 	var tlsCert tls.Certificate
@@ -277,6 +271,7 @@ func (auth *MeshAuth) InitSelfSigned(kty string) {
 		tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.TrustDomain)
 	}
 	auth.SetTLSCertificate(&tlsCert)
+	return auth
 }
 
 // mesh certificates - new style

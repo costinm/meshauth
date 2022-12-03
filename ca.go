@@ -144,7 +144,6 @@ func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error)
 	var priv crypto.PrivateKey
 
 	rsaKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	// rsa.GenerateKey(rand.Reader, 2048)
 	priv = rsaKey
 
 	csr := GenCSRTemplate(a.TrustDomain, san)
@@ -155,12 +154,6 @@ func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error)
 	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
 
 	var encodedKey []byte
-	//if pkcs8 {
-	//	if encodedKey, err = x509.MarshalPKCS8PrivateKey(priv); err != nil {
-	//		return nil, nil, err
-	//	}
-	//	privPem = pem.EncodeToMemory(&pem.Block{Type: blockTypePKCS8PrivateKey, Bytes: encodedKey})
-	//} else {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		encodedKey = x509.MarshalPKCS1PrivateKey(k)
@@ -172,7 +165,6 @@ func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error)
 		}
 		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
 	}
-	//}
 
 	return
 }
