@@ -654,19 +654,19 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 		bb.Write(b)
 	}
 
-	err = ioutil.WriteFile(keyFile, p, 0660)
+	err = ioutil.WriteFile(keyFile, p, 0666)
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(chainFile, bb.Bytes(), 0660)
+	err = ioutil.WriteFile(chainFile, bb.Bytes(), 0666)
 	if err != nil {
 		return err
 	}
-	if os.Getuid() == 0 {
-		os.Chown(outDir, 1337, 1337)
-		os.Chown(keyFile, 1337, 1337)
-		os.Chown(chainFile, 1337, 1337)
-	}
+	//if os.Getuid() == 0 {
+	//	os.Chown(outDir, 1337, 1337)
+	//	os.Chown(keyFile, 1337, 1337)
+	//	os.Chown(chainFile, 1337, 1337)
+	//}
 
 	return nil
 }
