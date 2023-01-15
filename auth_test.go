@@ -22,7 +22,7 @@ const (
 
 func TestVapid(t *testing.T) {
 	rfcEx := "vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczovL3B1c2guZXhhbXBsZS5uZXQiLCJleHAiOjE0NTM1MjM3NjgsInN1YiI6Im1haWx0bzpwdXNoQGV4YW1wbGUuY29tIn0.i3CYb7t4xfxCDquptFOepC9GAu_HLGkMlMuCGSK2rpiUfnK9ojFwDXb1JrErtmysazNjjvW2L9OkSSHzvoD1oA, " +
-		"k=BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
+			"k=BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
 
 	rfcT, rfcP, err := CheckVAPID(rfcEx, time.Time{})
 	if err != nil {
@@ -162,4 +162,16 @@ func BenchmarkVerify(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		Verify(pubb, pubb, sig)
 	}
+}
+
+func TestXFCC(t *testing.T) {
+	vals := ParseXFCC(`By=spiffe://cluster.local/ns/ssh-ca/sa/default;Hash=8813da93b;Subject="";URI=spiffe://cluster.local/ns/sshd/sa/default`)
+	if vals["By"] != "spiffe://cluster.local/ns/ssh-ca/sa/default" {
+		t.Error("Missing By")
+	}
+
+	if vals["URI"] != "spiffe://cluster.local/ns/sshd/sa/default" {
+		t.Error("Missing URI")
+	}
+
 }

@@ -44,6 +44,8 @@ import (
 // - native library also supports nested TLS - if the RoundTripStart method is overriden and scheme is https,
 //    it will do a TLS handshake anyway and RoundTripStart can implement TLS for the outer tunnel.
 
+// MeshAuthCfg is used to configure the MeshAuth object.
+// Some missing info can be detected from the environment.
 type MeshAuthCfg struct {
 	// Will attempt to load/reload certificates from this directory.
 	// If empty, FromEnv will auto-detect.
@@ -80,7 +82,7 @@ type MeshAuthCfg struct {
 // MeshAuth represents a workload identity and associated info required for minimal
 // mesh-compatible security. Includes helpers for authentication and basic provisioning.
 //
-// By default will attempt to load a workload cert, and extract info from the cert.
+// By default it will attempt to load a workload cert, and extract info from the cert.
 type MeshAuth struct {
 	*MeshAuthCfg
 
@@ -123,6 +125,35 @@ type MeshAuth struct {
 	CertMap map[string]*tls.Certificate
 	// GetCertificateHook allows plugging in an alternative certificate provider.
 	GetCertificateHook func(host string) (*tls.Certificate, error)
+
+	AuthProviders map[string]TokenSource
+}
+
+// TokenSource is a common interface for anything returning Bearer tokens.
+type TokenSource interface {
+	// GetToken for a given audience.
+	GetToken(context.Context, string) (string, error)
+}
+
+// PerRPCCredentials defines the common interface for the credentials which need to
+// attach security information to every RPC (e.g., oauth2).
+// This is the interface used by gRPC - should be implemented by all TokenSource to
+// allow use with gRPC.
+type PerRPCCredentials interface {
+	// GetRequestMetadata gets the current request metadata, refreshing
+	// tokens if required. This should be called by the transport layer on
+	// each request, and the data should be populated in headers or other
+	// context. If a status code is returned, it will be used as the status
+	// for the RPC. uri is the URI of the entry point for the request.
+	// When supported by the underlying implementation, ctx can be used for
+	// timeout and cancellation. Additionally, RequestInfo data will be
+	// available via ctx to this call.
+	// TODO(zhaoq): Define the set of the qualified keys instead of leaving
+	// it as an arbitrary string.
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity indicates whether the credentials requires
+	// transport security.
+	RequireTransportSecurity() bool
 }
 
 // NewMeshAuth creates the auth object, without any certifcates.

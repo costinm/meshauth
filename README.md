@@ -1,11 +1,23 @@
-# Minimal auth library for certs and tokens
+# Minimal mesh-focused auth library
+
+This is an attempt to have a small, WASM and low-resource-use friendly library with no
+external dependencies encapsulating the most common mesh auth and provisioning patterns.
+
+Provisioning (metadata) is sometimes separated from auth - but it is safer and simpler
+and treat both as part of the 'security' layer.
 
 The code is in large part based on/forked from Istio and few of my projects, to remove dependencies and keep a minimal
 package for native mesh integration.
 
+Plugins:
+
+- discovery mechanisms for destination metadata (for example XDS).
+- certificate provisioning
+- transports
+
 ## Certificates
 
-Code to lookup certificates in the locations used in Istio/GKE and
+The code will lookup certificates in the locations used in Istio/GKE and
 generate certs for self-signed or testing. Includes the minimal CA
 code, similar to Citadel.
 
@@ -46,12 +58,19 @@ GKE token.
 
 It requires 3 round-trips, but can be cached and pre-fetched.
 
+The most important is the federated exchange, which requires a token with
+PROJECT_ID.svc.id.goog audience issued by a GKE cluster. Other IDP providers can
+be used as well - with an associated federation config.
+
+The federated token is a google access token associated with the 'foreign' K8S identity
+which can be used directly by some services, or exchanged with a regular GSA that allows
+delegation.
+
 ```bash
 
 
-$ kubectl -n validation-temp-ns -c istio-proxy exec sleep-6758c4cb78-2gtpp -- cat /var/run/secrets/tokens/istio-token >  ../istiod/var/run/secrets/tokens/istio-token
-
-
+$ kubectl -n validation-temp-ns -c istio-proxy exec sleep-6758c4cb78-2gtpp -- \
+  cat /var/run/secrets/tokens/istio-token >  istio-token
 
 $ curl -v https://securetoken.googleapis.com/v1/identitybindingtoken -HContent-Type:application/json -d @exch.json
 

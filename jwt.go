@@ -3,11 +3,17 @@ package meshauth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
 // Auth in hbone is primarily mTLS-based, but in some cases JWTs are used.
 // Few minimal helper functions to avoid deps and handle k8s-specific variant.
+
+type JWTHead struct {
+	Typ string `json:"typ"`
+	Alg string `json:"alg,omitempty"`
+}
 
 // JWT includes minimal field for a JWT, primarily for extracting iss for the exchange.
 // This is used with K8S JWTs, which use multi-string.
@@ -104,4 +110,33 @@ func DecodeJWT(jwt string) *JWT {
 	j := &JWT{}
 	_ = json.Unmarshal([]byte(payload), j)
 	return j
+}
+
+func JwtRawParse(tok string) (*JWTHead, *JWT, []byte, []byte, error) {
+	// Token is parsed with square/go-jose
+	parts := strings.Split(tok, ".")
+	if len(parts) < 2 {
+		return nil, nil, nil, nil, fmt.Errorf("VAPID: malformed jwt, parts=%d", len(parts))
+	}
+	head, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+	}
+	h := &JWTHead{}
+	json.Unmarshal(head, h)
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+	}
+	b := &JWT{}
+	json.Unmarshal(payload, b)
+	b.Raw = string(payload)
+
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+	}
+
+	return h, b, []byte(tok[0 : len(parts[0])+len(parts[1])+1]), sig, nil
 }

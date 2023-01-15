@@ -46,7 +46,7 @@ func TestK8S(t *testing.T) {
 	// Without audience overide - K8SCluster is a TokenSource as well
 	tok, err := def.GetToken(ctx, "http://example.com")
 	if err != nil {
-		t.Error(err)
+		t.Error("Getting tokens with audience from k8s", err)
 	}
 
 	_, tokT, _, _, _ := JwtRawParse(tok)

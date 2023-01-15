@@ -79,7 +79,7 @@ func TestRfcVectors(t *testing.T) {
 		t.Error(err)
 	}
 
-	ec := &EncryptionContext{
+	ec := &WebpushEncryption{
 		Auth:     auth,
 		UAPublic: key,
 
@@ -104,8 +104,8 @@ func TestRfcVectors(t *testing.T) {
 	}
 }
 
-func Encrypt(key []byte, auth []byte, m string) (*EncryptionContext, error) {
-	ec := &EncryptionContext{
+func Encrypt(key []byte, auth []byte, m string) (*WebpushEncryption, error) {
+	ec := &WebpushEncryption{
 		Auth:     auth,
 		UAPublic: key,
 	}
@@ -128,14 +128,23 @@ func TestSharedSecret(t *testing.T) {
 }
 
 func BenchmarkEncrypt(b *testing.B) {
-	sub, _ := SubscriptionFromJSON(subscriptionJSON)
+	sub, _ := WebpushSubscriptionToDest(subscriptionJSON)
 	for i := 0; i < b.N; i++ {
-		Encrypt(sub.Key, sub.Auth, "Hello world")
+		Encrypt(sub.WebpushPublicKey, sub.WebpushAuth, "Hello world")
 	}
 }
 
+func TestEncrypt(t *testing.T) {
+	sub, _ := WebpushSubscriptionToDest(subscriptionJSON)
+	_, err := Encrypt(sub.WebpushPublicKey, sub.WebpushAuth, "Hello world")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+}
+
 //func BenchmarkEncryptWithKey(b *testing.B) {
-//	sub, _ := SubscriptionFromJSON(subscriptionJSON)
+//	sub, _ := WebpushSubscriptionToDest(subscriptionJSON)
 //	plain := []byte("Hello world")
 //	serverPrivateKey, serverPublicKey, _ := randomKey()
 //
@@ -149,17 +158,17 @@ func Test2Way(t *testing.T) {
 
 	subPriv, subPub, err := randomKey()
 	auth, err := b64.DecodeString("68zcbmaevQa7MS7aXXRX8Q")
-	sub := &Subscription{
-		Endpoint: "https://foo.com",
-		Auth:     auth,
-		Key:      subPub,
+	sub := &Dest{
+		BaseAddr:         "https://foo.com",
+		WebpushAuth:      auth,
+		WebpushPublicKey: subPub,
 	}
-	result, err := Encrypt(sub.Key, sub.Auth, message)
+	result, err := Encrypt(sub.WebpushPublicKey, sub.WebpushAuth, message)
 	if err != nil {
 		t.Error(err)
 	}
 
-	dc := EncryptionContext{
+	dc := WebpushEncryption{
 		UAPrivate: subPriv,
 		UAPublic:  subPub,
 		Auth:      auth,
@@ -225,7 +234,7 @@ func TestWebpush(t *testing.T) {
 	body := "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN"
 	bodyB, _ := base64.RawURLEncoding.DecodeString(body)
 
-	ec := NewContextSend(rv.PublicKey, authB)
+	ec := NewWebpushEncryption(rv.PublicKey, authB)
 	// To reproduce the same output, use the key from the RFC.
 	ec.SendPrivate = sv.Priv
 	ec.SendPublic = sv.PublicKey
@@ -240,7 +249,7 @@ func TestWebpush(t *testing.T) {
 		t.Error("Failed to encrypt")
 	}
 
-	dc := NewContextUA(rv.Priv, rv.PublicKey, authB)
+	dc := NewWebpushDecryption(rv.Priv, rv.PublicKey, authB)
 	plain1, err := dc.Decrypt(cipher)
 	if err != nil {
 		t.Fatal(err)
@@ -250,14 +259,14 @@ func TestWebpush(t *testing.T) {
 		t.Error("Failed to decrypt")
 	}
 
-	ec1 := NewContextSend(rv.PublicKey, authB)
+	ec1 := NewWebpushEncryption(rv.PublicKey, authB)
 	cipher, _ = ec1.Encrypt([]byte{1})
 	if len(cipher) != 104 {
 		t.Error("One byte expecting 104 got ", len(cipher))
 	}
 	log.Printf("Encrypt 1 byte to %d", len(cipher))
 
-	ec2 := NewContextUA(rv.Priv, rv.PublicKey, authB)
+	ec2 := NewWebpushDecryption(rv.Priv, rv.PublicKey, authB)
 	plainB, err := ec2.Decrypt(cipher)
 	if err != nil {
 		t.Fatal(err)

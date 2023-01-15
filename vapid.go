@@ -42,13 +42,8 @@ var (
 	dot           = []byte(".")
 )
 
-type JWTHead struct {
-	Typ string `json:"typ"`
-	Alg string `json:"alg,omitempty"`
-}
-
 // VAPIDToken creates a token with the specified endpoint, using configured Sub id
-// and a default expiration (1h). The identity must be based on EC256.
+// and a default expiration (1h). The MeshAuth identity must be based on EC256.
 //
 // Format is "vapid t=TOKEN k=PUBKEY
 //
@@ -125,35 +120,6 @@ func (auth *MeshAuth) rawVAPIDSign(t []byte) string {
 	token = append(token, sigB64...)
 
 	return "vapid t=" + string(token) + ", k=" + auth.PublicKeyBase64
-}
-
-func JwtRawParse(tok string) (*JWTHead, *JWT, []byte, []byte, error) {
-	// Token is parsed with square/go-jose
-	parts := strings.Split(tok, ".")
-	if len(parts) < 2 {
-		return nil, nil, nil, nil, fmt.Errorf("VAPID: malformed jwt, parts=%d", len(parts))
-	}
-	head, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
-	}
-	h := &JWTHead{}
-	json.Unmarshal(head, h)
-
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
-	}
-	b := &JWT{}
-	json.Unmarshal(payload, b)
-	b.Raw = string(payload)
-
-	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
-	}
-
-	return h, b, []byte(tok[0 : len(parts[0])+len(parts[1])+1]), sig, nil
 }
 
 func jwtParseAndCheckSig(tok string, pk crypto.PublicKey) (*JWT, error) {

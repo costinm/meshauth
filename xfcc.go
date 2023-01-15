@@ -44,26 +44,3 @@ func ParseXFCC(val string) map[string]string {
 	}
 	return m
 }
-
-type RemoteID struct {
-	TrustDomain    string
-	Namespace      string
-	ServiceAccount string
-}
-
-func RemoteIDmTLS(xfcc string) *RemoteID {
-	vals := ParseXFCC(xfcc)
-	spiffe := vals["URI"]
-	if spiffe == "" || !strings.HasPrefix(spiffe, "spiffe://") {
-		return nil
-	}
-	parts := strings.Split(spiffe[9:], "/")
-	if len(parts) < 5 || parts[1] != "ns" || parts[3] != "sa" {
-		return nil
-	}
-	return &RemoteID{
-		TrustDomain:    parts[0],
-		Namespace:      parts[2],
-		ServiceAccount: parts[4],
-	}
-}

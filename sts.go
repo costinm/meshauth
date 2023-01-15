@@ -33,27 +33,28 @@ import (
 // From nodeagent/plugin/providers/google/stsclient
 // In Istio, the code is used if "GoogleCA" is set as CA_PROVIDER or CA_ADDR has the right prefix
 var (
-	// SecureTokenEndpoint is the Endpoint the STS client calls to.
-	SecureTokenEndpoint = "https://sts.googleapis.com/v1/token"
-
-	contentType         = "application/json"
-	Scope               = "https://www.googleapis.com/auth/cloud-platform"
+	// secureTokenEndpoint is the Endpoint the STS client calls to.
+	secureTokenEndpoint = "https://sts.googleapis.com/v1/token"
 	accessTokenEndpoint = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken"
 	idTokenEndpoint     = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateIdToken"
+
+	contentType = "application/json"
+	Scope       = "https://www.googleapis.com/auth/cloud-platform"
 
 	// Server side
 	// TokenPath is url path for handling STS requests.
 	TokenPath = "/token"
 	// StsStatusPath is the path for dumping STS status.
 	StsStatusPath = "/stsStatus"
-	// URLEncodedForm is the encoding type specified in a STS request.
-	URLEncodedForm = "application/x-www-form-urlencoded"
-	// TokenExchangeGrantType is the required value for "grant_type" parameter in a STS request.
-	TokenExchangeGrantType = "urn:ietf:params:oauth:grant-type:token-exchange"
-	// SubjectTokenType is the required token type in a STS request.
-	SubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
 
-	Debug = false
+	// urlEncodedForm is the encoding type specified in a STS request.
+	urlEncodedForm = "application/x-www-form-urlencoded"
+
+	// tokenExchangeGrantType is the required value for "grant_type" parameter in a STS request.
+	tokenExchangeGrantType = "urn:ietf:params:oauth:grant-type:token-exchange"
+
+	// subjectTokenType is the required token type in a STS request.
+	subjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
 )
 
 // error code sent in a STS error response. A full list of error code is
@@ -69,8 +70,8 @@ const (
 	stsIssuedTokenType = "urn:ietf:params:oauth:token-type:access_token"
 )
 
-// AuthConfig contains the settings for getting tokens using K8S or federated tokens.
-type AuthConfig struct {
+// STSAuthConfig contains the settings for getting tokens using K8S or federated tokens.
+type STSAuthConfig struct {
 	// Used to construct the default GSA for ASM
 	//  "service-" + kr.ProjectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
 	ProjectNumber string
@@ -78,32 +79,47 @@ type AuthConfig struct {
 	// TrustDomain to use - typically based on fleet_project_name.svc.id.goog
 	TrustDomain string
 
-	// GKE Cluster address.
+	// GKE Dest address.
 	// https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s
 	// It is also the iss field in the token.
 	ClusterAddress string
 
-	// TokenSource returns K8S or federated tokens with a given audience.
+	// TokenSource returns K8S or 'federation enrolled IDP' tokens with a given audience.
+	// Will be called with the 'TrustDomain' as audience for GCP.
 	TokenSource TokenSource
-}
 
-type TokenSource interface {
-	// GetToken for a given audience.
-	GetToken(context.Context, string) (string, error)
+	// Endpoint for the STS exchange - takes a IDP JWT and gets back a federated access token.
+	// For google: "https://sts.googleapis.com/v1/token"
+	STSEndpoint string
+
+	// Endpoint gets a federated access token (or any other access token with permissions),
+	// returns an access token for the target service account
+	// For google:  "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken"
+	AccessTokenEndpoint string
+
+	// Similar to AccessTokenEndpoint, but returns ID tokens (JWTs with audience)
+	// For google:  "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateIdToken"
+	IDTokenEndpoint string
+
+	// Scope to use in the STS exchange.
+	// For google: "https://www.googleapis.com/auth/cloud-platform"
+	Scope string
+
+	// UseAccessToken will force returning a GSA access token, regardless of audience.
+	// Only valid for FederatedTokenSource, or if a GSA is provided.
+	UseAccessToken bool
 }
 
 // STS provides token exchanges. Implements grpc and golang.org/x/oauth2.TokenSource
-// The source of trust is the K8S token with TrustDomain audience, it is exchanged with access or WorkloadID tokens.
+// The source of trust is the K8S or other IDP token with TrustDomain audience, it is exchanged with
+// access or WorkloadID tokens.
 type STS struct {
 	httpClient *http.Client
-	kr         *AuthConfig
+	cfg        *STSAuthConfig
 
 	// Google service account to impersonate and return tokens for.
 	// The KSA returned from K8S must have the IAM permissions
 	GSA string
-
-	// UseAccessToken will force returning a GSA access token, regardless of audience.
-	UseAccessToken bool
 }
 
 // NewGSATokenSource returns a oauth2.TokenSource and
@@ -114,7 +130,7 @@ type STS struct {
 // suitable for connecting to stackdriver and out-of-cluster managed Istiod.
 // Otherwise, the gsa must grant the KSA (kubernetes service account)
 // permission to act as the GSA.
-func NewGSATokenSource(kr *AuthConfig, gsa string) *STS {
+func NewGSATokenSource(kr *STSAuthConfig, gsa string) *STS {
 	sts := NewFederatedTokenSource(kr)
 	if gsa == "" {
 		// use the mesh default SA
@@ -133,14 +149,18 @@ func NewGSATokenSource(kr *AuthConfig, gsa string) *STS {
 // all APIs - in particular MeshCA requires this token.
 //
 // https://cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token
-func NewFederatedTokenSource(kr *AuthConfig) *STS {
+func NewFederatedTokenSource(kr *STSAuthConfig) *STS {
 	caCertPool, err := x509.SystemCertPool()
 	if err != nil {
 		log.Fatal("Missing system cert pool")
 	}
+	if kr == nil {
+		kr = &STSAuthConfig{}
+	}
 
 	return &STS{
-		kr: kr,
+		cfg: kr,
+
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
@@ -156,10 +176,6 @@ func (s *STS) md(t string) map[string]string {
 	res := map[string]string{
 		"authorization": "Bearer " + t,
 	}
-	//if s.kr.ProjectNumber != "" {
-	// Breaks MeshCA
-	//res["x-goog-user-project"] = s.kr.ProjectNumber
-	//}
 	return res
 }
 
@@ -182,7 +198,7 @@ func (s *STS) GetRequestMetadata(ctx context.Context, aud ...string) (map[string
 
 func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
 	// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
-	kt, err := s.kr.TokenSource.GetToken(ctx, s.kr.TrustDomain)
+	kt, err := s.cfg.TokenSource.GetToken(ctx, s.cfg.TrustDomain)
 	if err != nil {
 		return "", err
 	}
@@ -212,42 +228,42 @@ func (s *STS) RequireTransportSecurity() bool {
 //
 // (formerly called ExchangeToken)
 func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, error) {
-	if s.kr.ClusterAddress == "" {
+	if s.cfg.ClusterAddress == "" {
 		// First time - construct it from the K8S token
 		j := DecodeJWT(k8sSAjwt)
-		s.kr.ClusterAddress = j.Iss
+		s.cfg.ClusterAddress = j.Iss
 	}
 	// Encodes trustDomain, projectid, clustername, location
-	stsAud := s.constructAudience(s.kr.TrustDomain)
+	stsAud := s.constructAudience(s.cfg.TrustDomain)
 
 	jsonStr, err := s.constructFederatedTokenRequest(stsAud, k8sSAjwt)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal federated token request: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", SecureTokenEndpoint, bytes.NewBuffer(jsonStr))
+	req, err := http.NewRequest("POST", secureTokenEndpoint, bytes.NewBuffer(jsonStr))
 	req = req.WithContext(ctx)
 
 	res, err := s.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("token exchange failed: %v, (aud: %s, STS endpoint: %s)", err, stsAud, SecureTokenEndpoint)
+		return "", fmt.Errorf("token exchange failed: %v, (aud: %s, STS endpoint: %s)", err, stsAud, secureTokenEndpoint)
 	}
 
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return "", fmt.Errorf("token exchange read failed: %v, (aud: %s, STS endpoint: %s)", err, stsAud, SecureTokenEndpoint)
+		return "", fmt.Errorf("token exchange read failed: %v, (aud: %s, STS endpoint: %s)", err, stsAud, secureTokenEndpoint)
 	}
 	respData := &federatedTokenResponse{}
 	if err := json.Unmarshal(body, respData); err != nil {
 		// Normally the request should json - extremely hard to debug otherwise, not enough info in status/err
 		log.Println("Unexpected unmarshal error, response was ", string(body))
 		return "", fmt.Errorf("(aud: %s, STS endpoint: %s), failed to unmarshal response data of size %v: %v",
-			stsAud, SecureTokenEndpoint, len(body), err)
+			stsAud, secureTokenEndpoint, len(body), err)
 	}
 
 	if respData.AccessToken == "" {
 		return "", fmt.Errorf(
-			"exchanged empty token (aud: %s, STS endpoint: %s), response: %v", stsAud, SecureTokenEndpoint, string(body))
+			"exchanged empty token (aud: %s, STS endpoint: %s), response: %v", stsAud, secureTokenEndpoint, string(body))
 	}
 
 	return respData.AccessToken, nil
@@ -338,7 +354,7 @@ func (s *STS) TokenGSA(ctx context.Context, federatedToken string, audience stri
 }
 
 func isAccessToken(audience string, s *STS) bool {
-	return audience == "" || s.UseAccessToken || strings.Contains(audience, "googleapis.com")
+	return audience == "" || s.cfg.UseAccessToken || strings.Contains(audience, "googleapis.com")
 }
 
 type federatedTokenResponse struct {
@@ -359,7 +375,7 @@ type federatedTokenResponse struct {
 // or gcloud URL
 // Required when exchanging an external credential for a Google access token.
 func (s *STS) constructAudience(trustDomain string) string {
-	return fmt.Sprintf("identitynamespace:%s:%s", trustDomain, s.kr.ClusterAddress)
+	return fmt.Sprintf("identitynamespace:%s:%s", trustDomain, s.cfg.ClusterAddress)
 }
 
 // fetchFederatedToken exchanges a third-party issued Json Web Token for an OAuth2.0 access token
@@ -381,9 +397,9 @@ func (s *STS) constructFederatedTokenRequest(aud, jwt string) ([]byte, error) {
 
 // from security/security.go
 
-// StsRequestParameters stores all STS request attributes defined in
+// stsRequestParameters stores all STS request attributes defined in
 // https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16#section-2.1
-type StsRequestParameters struct {
+type stsRequestParameters struct {
 	// REQUIRED. The value "urn:ietf:params:oauth:grant-type:token- exchange"
 	// indicates that a token exchange is being performed.
 	GrantType string
@@ -414,10 +430,10 @@ type StsRequestParameters struct {
 
 // From stsservice/sts.go
 
-// StsResponseParameters stores all attributes sent as JSON in a successful STS
+// stsResponseParameters stores all attributes sent as JSON in a successful STS
 // response. These attributes are defined in
 // https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16#section-2.2.1
-type StsResponseParameters struct {
+type stsResponseParameters struct {
 	// REQUIRED. The security token issued by the authorization server
 	// in response to the token exchange request.
 	AccessToken string `json:"access_token"`
@@ -514,6 +530,13 @@ func (s *STS) constructGenerateAccessTokenRequest(fResp string, audience string,
 
 // ServeStsRequests handles STS requests and sends exchanged token in responses.
 // RFC8693 - token exchange
+//
+// This is intended for localhost use with Envoy - it matches the protocol used by envoy.
+// Envoy does send a JWT loaded from a file - this is ignored since we trust localhost in
+// sidecar cases.
+//
+// It can also be used as a service, with proper Authz prior to
+//
 // ex. for GCP: https://cloud.google.com/iam/docs/reference/sts/rest/v1beta/TopLevel/token
 // https://cloud.google.com/iam/docs/reference/credentials/rest
 func (s *STS) ServeStsRequests(w http.ResponseWriter, req *http.Request) {
@@ -552,7 +575,7 @@ func (p *STS) generateSTSRespInner(token string) []byte {
 	//if err == nil {
 	//	expireInSec = int64(time.Until(exp).Seconds())
 	//}
-	stsRespParam := StsResponseParameters{
+	stsRespParam := stsResponseParameters{
 		AccessToken:     token,
 		IssuedTokenType: stsIssuedTokenType,
 		TokenType:       "Bearer",
@@ -563,8 +586,8 @@ func (p *STS) generateSTSRespInner(token string) []byte {
 }
 
 // validateStsRequest validates a STS request, and extracts STS parameters from the request.
-func (s *STS) validateStsRequest(req *http.Request) (StsRequestParameters, error) {
-	reqParam := StsRequestParameters{}
+func (s *STS) validateStsRequest(req *http.Request) (stsRequestParameters, error) {
+	reqParam := stsRequestParameters{}
 	if req == nil {
 		return reqParam, errors.New("request is nil")
 	}
@@ -576,24 +599,24 @@ func (s *STS) validateStsRequest(req *http.Request) (StsRequestParameters, error
 	if req.Method != "POST" {
 		return reqParam, fmt.Errorf("request method is invalid, should be POST but get %s", req.Method)
 	}
-	if req.Header.Get("Content-Type") != URLEncodedForm {
-		return reqParam, fmt.Errorf("request content type is invalid, should be %s but get %s", URLEncodedForm,
+	if req.Header.Get("Content-Type") != urlEncodedForm {
+		return reqParam, fmt.Errorf("request content type is invalid, should be %s but get %s", urlEncodedForm,
 			req.Header.Get("Content-type"))
 	}
 	if parseErr := req.ParseForm(); parseErr != nil {
 		return reqParam, fmt.Errorf("failed to parse query from STS request: %v", parseErr)
 	}
-	if req.PostForm.Get("grant_type") != TokenExchangeGrantType {
+	if req.PostForm.Get("grant_type") != tokenExchangeGrantType {
 		return reqParam, fmt.Errorf("request query grant_type is invalid, should be %s but get %s",
-			TokenExchangeGrantType, req.PostForm.Get("grant_type"))
+			tokenExchangeGrantType, req.PostForm.Get("grant_type"))
 	}
 	// Only a JWT token is accepted.
 	if req.PostForm.Get("subject_token") == "" {
 		return reqParam, errors.New("subject_token is empty")
 	}
-	if req.PostForm.Get("subject_token_type") != SubjectTokenType {
+	if req.PostForm.Get("subject_token_type") != subjectTokenType {
 		return reqParam, fmt.Errorf("subject_token_type is invalid, should be %s but get %s",
-			SubjectTokenType, req.PostForm.Get("subject_token_type"))
+			subjectTokenType, req.PostForm.Get("subject_token_type"))
 	}
 	reqParam.GrantType = req.PostForm.Get("grant_type")
 	reqParam.Resource = req.PostForm.Get("resource")
@@ -607,10 +630,10 @@ func (s *STS) validateStsRequest(req *http.Request) (StsRequestParameters, error
 	return reqParam, nil
 }
 
-// StsErrorResponse stores all Error parameters sent as JSON in a STS Error response.
+// stsErrorResponse stores all Error parameters sent as JSON in a STS Error response.
 // The Error parameters are defined in
 // https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16#section-2.2.2.
-type StsErrorResponse struct {
+type stsErrorResponse struct {
 	// REQUIRED. A single ASCII Error code.
 	Error string `json:"error"`
 	// OPTIONAL. Human-readable ASCII [USASCII] text providing additional information.
@@ -628,7 +651,7 @@ func (s *STS) sendErrorResponse(w http.ResponseWriter, errorType string, errDeta
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
-	errResp := StsErrorResponse{
+	errResp := stsErrorResponse{
 		Error:            errorType,
 		ErrorDescription: errDetail.Error(),
 	}

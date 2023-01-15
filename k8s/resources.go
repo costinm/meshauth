@@ -343,7 +343,7 @@ type CreateTokenResponse struct {
 //
 // "User" has credentials - "default" is the workload WorkloadID.
 //
-// "Context" pairs a Cluster with a User.
+// "Context" pairs a Dest with a User.
 // "default" is the upstream / primary server
 //
 
