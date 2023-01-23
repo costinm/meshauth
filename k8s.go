@@ -18,8 +18,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/costinm/meshauth/k8s"
 )
 
 // K8SCluster provides authentication and basic communication with a K8S cluster.
@@ -27,9 +25,11 @@ import (
 // secrets and config maps and getting tokens.
 //
 // K8S is an identity provider, and supports multiple credential types for exchange.
+// If the app runs in K8S, it expects to find info in well-known locations.
+// If it doesn't - it expects to have a KUBECONFIG or ~/.kube/config - or some
+// other mechanism to get the address/credentials.
 type K8SCluster struct {
 	Addr  string
-	ID    string
 	Token string
 
 	CACertPEM []byte
@@ -39,9 +39,16 @@ type K8SCluster struct {
 	Env            map[string]string
 
 	HttpClient HttpClient
-	Location   string
-	ProjectID  string
-	Path       string
+
+	// Location and project are only set for GKE clusters (loaded from mesh config).
+	// For in-cluster - should be injected ?
+	Location  string
+	ProjectID string
+	// Basic cluster name - not unique, full ClusterName is based on location and project ClusterName
+	ClusterName string
+
+	Path string
+
 	// TokenProvider is used to get 'admin' tokens (with RBAC permission to get other kinds
 	// of tokens and configs)
 	TokenProvider func(ctx context.Context, aud string) (string, error)
@@ -113,19 +120,13 @@ func (k *K8SCluster) GetConfigMap(ctx context.Context, ns string, name string) (
 	}
 
 	data, err := io.ReadAll(res.Body)
-	var secret k8s.ConfigMap
+	var secret ConfigMap
 	err = json.Unmarshal(data, &secret)
 	if err != nil {
 		return nil, err
 	}
 
 	return secret.Data, nil
-}
-
-func NewK8STokenSource(k *K8SCluster, ns, ksa, audOverride string) *K8sTokenSource {
-	return &K8sTokenSource{
-		Cluster: k,
-	}
 }
 
 func (f *K8sTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
@@ -219,7 +220,7 @@ func (k *K8SCluster) GetTokenRaw(ctx context.Context, ns, name, aud string) (str
 		return "", err
 	}
 
-	var secret k8s.CreateTokenResponse
+	var secret CreateTokenResponse
 	err = json.Unmarshal(data, &secret)
 	if err != nil {
 		return "", err
@@ -242,8 +243,11 @@ func (k *K8SCluster) Do(r *http.Request) ([]byte, error) {
 		return nil, errors.New(fmt.Sprintf("K8S error %d %s", res.StatusCode, string(data)))
 	}
 	return data, nil
-
 }
+
+const (
+	MeshProjectNumber = "PROJECT_NUMBER"
+)
 
 // Get a mesh env setting. May be replaced by an env variable.
 // Used to configure PROJECT_NUMBER and other internal settings.
@@ -262,7 +266,7 @@ func (ms *K8SCluster) GetEnv(k, def string) string {
 
 // InitK8S will detect k8s env, and if present will load the mesh defaults and init
 // authenticators.
-func InitK8S(ctx context.Context, kc *k8s.KubeConfig) (*K8SCluster, map[string]*K8SCluster, error) {
+func InitK8S(ctx context.Context, kc *KubeConfig) (*K8SCluster, map[string]*K8SCluster, error) {
 	var err error
 	var def *K8SCluster
 	var extra map[string]*K8SCluster
@@ -295,6 +299,17 @@ func InitK8S(ctx context.Context, kc *k8s.KubeConfig) (*K8SCluster, map[string]*
 	return def, extra, nil
 }
 
+// LoadMeshEnv will load the 'mesh-env' config map in istio-system, and save the
+// settings.
+//
+// This is required for:
+//   - getting the PROJECT_NUMBER, for GCP access/id token - used for stackdriver or MCP (not
+//     required for federated tokens and certs)
+//   - getting the 'mesh connector' address - used to connect to Istiod from 'outside'
+//   - getting cluster info - if the K8S cluster is not initiated using a kubeconfig (we can
+//     extract it from names).
+//
+// TODO: get cluster info by getting an initial token.
 func (def *K8SCluster) LoadMeshEnv(ctx context.Context) error {
 	// Found a K8S cluster, try to locate configs in K8S by getting a config map containing Istio properties
 	cm, err := def.GetConfigMap(ctx, "istio-system", "mesh-env")
@@ -311,6 +326,15 @@ func (def *K8SCluster) LoadMeshEnv(ctx context.Context) error {
 		log.Println("Invalid mesh-env config map", err)
 		return err
 	}
+	if def.ProjectID == "" {
+		def.ProjectID = def.GetEnv("PROJECT_ID", "")
+	}
+	if def.Location == "" {
+		def.Location = def.GetEnv("CLUSTER_LOCATION", "")
+	}
+	if def.ClusterName == "" {
+		def.ClusterName = def.GetEnv("CLUSTER_NAME", "")
+	}
 	return nil
 }
 
@@ -322,57 +346,58 @@ func (k *K8SCluster) NewK8STokenSource(audOverride string) *K8sTokenSource {
 	}
 }
 
+// Init a federated GCP token source - using K8S provider and STS exchange.
 func (def *K8SCluster) GCPFederatedSource(ctx context.Context) (*STS, error) {
-	// Init a GCP token source - using K8S provider and exchange.
-	// TODO: if we already have a GCP GSA, we can use that directly.
-	projectNumber := def.GetEnv("PROJECT_NUMBER", "")
-	projectId := def.GetEnv("PROJECT_ID", "")
-	clusterLocation := def.GetEnv("CLUSTER_LOCATION", "")
-	clusterName := def.GetEnv("CLUSTER_NAME", "")
 
-	if projectId != "" && clusterName != "" && clusterLocation != "" && projectNumber != "" {
-		sts := NewFederatedTokenSource(&STSAuthConfig{
-			TrustDomain: projectId + ".svc.id.goog",
-			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
-				projectId, clusterLocation, clusterName),
+	sts := NewFederatedTokenSource(&STSAuthConfig{
+		TrustDomain: def.ProjectID + ".svc.id.goog",
+		//ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
+		//	projectId, clusterLocation, clusterName),
 
-			// Will use TokenRequest to get tokens with AudOverride
-			TokenSource: &K8sTokenSource{
-				Cluster:     def,
-				AudOverride: projectId + ".svc.id.goog",
-				Namespace:   def.Namespace,
-				KSA:         def.ServiceAccount},
-		})
-		return sts, nil
-	}
-	return nil, nil
+		// Will use TokenRequest to get tokens with AudOverride
+		TokenSource: &K8sTokenSource{
+			Cluster:     def,
+			AudOverride: def.ProjectID + ".svc.id.goog",
+			Namespace:   def.Namespace,
+			KSA:         def.ServiceAccount},
+	})
+	return sts, nil
 }
 
-func (def *K8SCluster) GCPAccessTokenSource(ctx context.Context) (*STS, error) {
-	// Init a GCP token source - using K8S provider and exchange.
-	// TODO: if we already have a GCP GSA, we can use that directly.
-	projectNumber := def.GetEnv("PROJECT_NUMBER", "")
-	projectId := def.GetEnv("PROJECT_ID", "")
-	clusterLocation := def.GetEnv("CLUSTER_LOCATION", "")
-	clusterName := def.GetEnv("CLUSTER_NAME", "")
-
-	if projectId != "" && clusterName != "" && clusterLocation != "" && projectNumber != "" {
-		// This returns JWT tokens for k8s
-		//audTokenS := k8s.K8sTokenSource{Dest: k8sdefault, Namespace: hb.Namespace,
-		//	KSA: hb.ServiceAccount}
-		audTokenS := NewGSATokenSource(&STSAuthConfig{
-			ProjectNumber: projectNumber,
-			TrustDomain:   projectId + ".svc.id.goog",
-			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
-				projectId, clusterLocation, clusterName),
-			TokenSource: &K8sTokenSource{
-				Cluster:   def,
-				Namespace: def.Namespace,
-				KSA:       def.ServiceAccount},
-		}, "")
-		return audTokenS, nil
+// GCPAccessTokenSource creates GCP access tokens for the given GSA. If empty, ASM default service account
+// will be used as long as PROJECT_NUMBER is set.
+func (def *K8SCluster) GCPAccessTokenSource(gsa string) (*GCPAuth, error) {
+	if gsa == "" {
+		// Init a GCP token source - using K8S provider and exchange.
+		// TODO: if we already have a GCP GSA, we can use that directly.
+		projectNumber := def.GetEnv("PROJECT_NUMBER", "")
+		if projectNumber == "" {
+			def.LoadMeshEnv(context.Background())
+			projectNumber = def.GetEnv("PROJECT_NUMBER", "")
+		}
+		if projectNumber == "" {
+			return nil, errors.New("Missing PROJECT_NUMBER")
+		}
+		gsa = "service-" + projectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
 	}
-	return nil, nil
+
+	// This returns JWT tokens for k8s
+	//audTokenS := k8s.K8sTokenSource{Dest: k8sdefault, Namespace: hb.Namespace,
+	//	KSA: hb.ServiceAccount}
+	fedS := NewFederatedTokenSource(&STSAuthConfig{
+		TrustDomain: def.ProjectID + ".svc.id.goog",
+		TokenSource: &K8sTokenSource{
+			Cluster:   def,
+			Namespace: def.Namespace,
+			KSA:       def.ServiceAccount},
+	})
+
+	audTokenS := NewGCPTokenSource(&GCPAuthConfig{
+		TokenSource: fedS,
+		GSA:         gsa,
+		TrustDomain: def.ProjectID + ".svc.id.goog",
+	})
+	return audTokenS, nil
 }
 
 // AddKubeConfigClusters extracts supported RestClusters from the kube config, returns the default and the list
@@ -381,9 +406,9 @@ func (def *K8SCluster) GCPAccessTokenSource(ctx context.Context) (*STS, error) {
 //
 // URest is used to configure TokenProvider and as factory for the http client.
 // Returns the default client and the list of non-default clients.
-func addKubeConfigClusters(kc *k8s.KubeConfig) (*K8SCluster, map[string]*K8SCluster, error) {
-	var cluster *k8s.KubeCluster
-	var user *k8s.KubeUser
+func addKubeConfigClusters(kc *KubeConfig) (*K8SCluster, map[string]*K8SCluster, error) {
+	var cluster *KubeCluster
+	var user *KubeUser
 
 	if kc == nil {
 		return nil, nil, nil
@@ -441,7 +466,7 @@ func addKubeConfigClusters(kc *k8s.KubeConfig) (*K8SCluster, map[string]*K8SClus
 	return defc, cByName, nil
 }
 
-func kubeconfig2Rest(name string, cluster *k8s.KubeCluster, user *k8s.KubeUser, ns string) (*K8SCluster, error) {
+func kubeconfig2Rest(name string, cluster *KubeCluster, user *KubeUser, ns string) (*K8SCluster, error) {
 	if ns == "" {
 		ns = "default"
 	}
@@ -475,9 +500,9 @@ func kubeconfig2Rest(name string, cluster *k8s.KubeCluster, user *k8s.KubeUser, 
 		//rc.ProjectId = parts[1]
 		rc.Location = parts[2]
 		rc.ProjectID = parts[1]
-		rc.ID = parts[3]
+		rc.ClusterName = parts[3]
 	} else {
-		rc.ID = name
+		rc.ClusterName = name
 	}
 
 	// May be useful to AddService: strings.HasPrefix(name, "gke_") ||
@@ -543,11 +568,11 @@ func inCluster() (*K8SCluster, error) {
 
 		ca, err := ioutil.ReadFile(rootCAFile)
 		c := &K8SCluster{
-			Addr:      net.JoinHostPort(host, port),
-			Server:    "https://" + net.JoinHostPort(host, port),
-			ID:        "k8s",
-			TokenFile: tokenFile,
-			CACertPEM: ca,
+			Addr:        net.JoinHostPort(host, port),
+			Server:      "https://" + net.JoinHostPort(host, port),
+			ClusterName: "k8s",
+			TokenFile:   tokenFile,
+			CACertPEM:   ca,
 		}
 
 		namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")

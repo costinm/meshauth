@@ -1,10 +1,12 @@
 package meshauth
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Auth in hbone is primarily mTLS-based, but in some cases JWTs are used.
@@ -112,20 +114,20 @@ func DecodeJWT(jwt string) *JWT {
 	return j
 }
 
-func JwtRawParse(tok string) (*JWTHead, *JWT, []byte, []byte, error) {
+func JwtRawParse(tok string) (head *JWTHead, jwt *JWT, payload []byte, sig []byte, err error) {
 	// Token is parsed with square/go-jose
 	parts := strings.Split(tok, ".")
 	if len(parts) < 2 {
 		return nil, nil, nil, nil, fmt.Errorf("VAPID: malformed jwt, parts=%d", len(parts))
 	}
-	head, err := base64.RawURLEncoding.DecodeString(parts[0])
+	headRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
 	}
 	h := &JWTHead{}
-	json.Unmarshal(head, h)
+	json.Unmarshal(headRaw, h)
 
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payload, err = base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
 	}
@@ -133,10 +135,26 @@ func JwtRawParse(tok string) (*JWTHead, *JWT, []byte, []byte, error) {
 	json.Unmarshal(payload, b)
 	b.Raw = string(payload)
 
-	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	sig, err = base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
 	}
 
 	return h, b, []byte(tok[0 : len(parts[0])+len(parts[1])+1]), sig, nil
+}
+
+type FileTokenSource struct {
+	File  string
+	Token string
+	Exp   time.Time
+}
+
+func (f *FileTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{
+		"authorization": "bearer " + f.Token,
+	}, nil
+}
+
+func (f *FileTokenSource) RequireTransportSecurity() bool {
+	return true
 }

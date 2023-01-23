@@ -1,13 +1,98 @@
 # Minimal mesh-focused auth library
 
-This is an attempt to have a small, WASM and low-resource-use friendly library with no
+This is an attempt to have a small, low-resource/WASM friendly library with no
 external dependencies encapsulating the most common mesh auth and provisioning patterns.
 
-Provisioning (metadata) is sometimes separated from auth - but it is safer and simpler
-and treat both as part of the 'security' layer.
+The code is in large part based on/forked from Istio and few of my projects, to remove dependencies  and keep a minimal package for native mesh integration.
 
-The code is in large part based on/forked from Istio and few of my projects, to remove dependencies and keep a minimal
-package for native mesh integration.
+Provisioning and config are sometimes separated from auth - but it is safer and simpler
+and treat both as part of the 'security' layer. This package will attempt to bootstrap 
+config using environment-provided certificate and secrets and provides support 
+for config updates using signed messages.
+
+
+## Goals
+
+- minimal code - only auth features commonly used in mesh with no external dependency
+- minimal user config - auto-detect as much as possible from environment.
+- clean and commented interactions with external systems
+- support Spiffee, DNS and Matter IOT certificates
+
+## Environment auto detection and configuration
+
+A mesh application may be deployed in multiple environments and requires a number
+of user-specific configs - trust domain, namespace, cluster names, etc. Setting it
+manually adds complexity to the helm/install charts, and is easy to get wrong with
+major negative impact. 
+
+
+Istio automates this using injection - adding a number of volumes and environemnt 
+variables. While some names are istio specific and not ideal, it is a good starting
+point and can be gradually improved.
+
+Istio has evolved and has to maintain backward compat - a lot of the env variables
+are duplicated, redundant or not really needed in all cases. 
+
+The current 'best practice' is to rely on a platform or CSI provider for client  
+certificates. In the absence of it, the app can authenticate using JWTs - it is possible
+to get them from TokenRequest (giving each service account permission to get tokens
+for itself), mounted tokens or platform metadata service. 
+
+The certificate and JWTs encode namespace, trust domain, service account info - and 
+may include cluster and project info.
+
+[Istio environment](docs/istio_env.md) lists all settings, only a subset will be
+required depending on the platform.
+
+### Platform certificates
+
+If the platform (CertManager, Spire, GKE) provisions each pod with 
+a Spiffee certificate, all information needed is available in the environment.
+
+### K8S with JWT token 
+
+If JWT tokens are not disabled (which is an advanced option), all information can also be extracted from the token.
+
+### VMs / containers / K8S without token
+
+
+
+### Env and Defaults
+
+- Root certificates for mesh communication:  - 
+  /var/run/secrets/.... (platform provided roots), /etc/ssl/certs/ca-certificates.crt (Istio injected pods default), XDS_ROOT_CA, CA_ROOT_CA, system certificates. 
+
+- Workload identity: 
+
+- Trust domain: extracted from cert or JWT, TRUST_DOMAIN. For GKE expected to be PROJECT_ID.svc.id.goog format.
+
+- Namespace: POD_NAMESPACE, extracted from cert/JWT
+
+- Pod name: POD_NAME, hostname
+
+- Service account: SERVICE_ACCOUNT, extracted from cert/JWT
+
+### K8S Cluster
+
+The availability of a K8S cluster will be detected and used to bootstrap:
+
+- KUBECONFIG env variable, ${HOME}/.kube/config - default cluster will be configured, 
+  and if name contains "_" will be interpreted as VENDOR_PROJECT_LOCATION_CLUSTER (gke style)
+
+- in-cluster configs files
+
+- 
+
+### Certificate provider
+
+In the absence of a 'platform certificate', the app should initiate 'commisioning'. 
+This is provided by separate libraries, since it depends on gRPC ( ligher versions
+also available for smaller binary size). 
+
+- Default is istiod.istio-system.svc:15012, using the JWT in ...
+- 
+
+# Integration
 
 Plugins:
 

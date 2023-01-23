@@ -236,7 +236,7 @@ func TestWebpush(t *testing.T) {
 
 	ec := NewWebpushEncryption(rv.PublicKey, authB)
 	// To reproduce the same output, use the key from the RFC.
-	ec.SendPrivate = sv.Priv
+	ec.SendPrivate = sv.ec256Priv
 	ec.SendPublic = sv.PublicKey
 	ec.Salt = saltB
 
@@ -249,7 +249,7 @@ func TestWebpush(t *testing.T) {
 		t.Error("Failed to encrypt")
 	}
 
-	dc := NewWebpushDecryption(rv.Priv, rv.PublicKey, authB)
+	dc := NewWebpushDecryption(rv.ec256Priv, rv.PublicKey, authB)
 	plain1, err := dc.Decrypt(cipher)
 	if err != nil {
 		t.Fatal(err)
@@ -266,7 +266,7 @@ func TestWebpush(t *testing.T) {
 	}
 	log.Printf("Encrypt 1 byte to %d", len(cipher))
 
-	ec2 := NewWebpushDecryption(rv.Priv, rv.PublicKey, authB)
+	ec2 := NewWebpushDecryption(rv.ec256Priv, rv.PublicKey, authB)
 	plainB, err := ec2.Decrypt(cipher)
 	if err != nil {
 		t.Fatal(err)

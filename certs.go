@@ -61,7 +61,8 @@ type MeshAuthCfg struct {
 	// Namespace and Name are extracted from the certificate or set by user.
 	// Namespace is used to verify peer certificates
 	Namespace string `json:"namespace,omitempty"`
-	// Name of the node, defaults to hostname or POD_NAME
+
+	// Name of the service account. Can be an email or user ID.
 	Name string `json:"name,omitempty"`
 
 	// Additional namespaces to allow access from. By default 'same namespace' and 'istio-system' are allowed.
@@ -75,8 +76,10 @@ type MeshAuthCfg struct {
 	PublicKey []byte `json:"pub,omitempty"`
 	CertBytes []byte `json:"cert,omitempty"`
 
+	ec256Priv []byte
+
 	// Root CAs, in DER format. CertPool only stores, can't retrieve.
-	RootCertificates [][]byte
+	RootCertificates [][]byte `json:"roots,omitempty"`
 }
 
 // MeshAuth represents a workload identity and associated info required for minimal
@@ -127,6 +130,8 @@ type MeshAuth struct {
 	GetCertificateHook func(host string) (*tls.Certificate, error)
 
 	AuthProviders map[string]TokenSource
+
+	MDS *MDS
 }
 
 // TokenSource is a common interface for anything returning Bearer tokens.
@@ -160,13 +165,15 @@ type PerRPCCredentials interface {
 // Must call SetTLSCertificate to initialize or one of the methods that finds or generates the cert.
 func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 	if cfg == nil {
-		cfg = &MeshAuthCfg{TrustDomain: "cluster.local"}
+		cfg = &MeshAuthCfg{}
 	}
 	a := &MeshAuth{
 		trustedCertPool: x509.NewCertPool(),
 		MeshAuthCfg:     cfg,
 		CertMap:         map[string]*tls.Certificate{},
+		MDS:             &MDS{},
 	}
+	a.MDS.MeshAuth = a
 	return a
 }
 
@@ -187,18 +194,18 @@ func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 // If a cert is not found, Cert field will be nil, and the app should
 // use one of the methods of getting a cert or call InitSelfSigned.
 func FromEnv(cfg *MeshAuthCfg) (*MeshAuth, error) {
-	a := NewMeshAuth(cfg)
 	if cfg == nil {
-		cfg = a.MeshAuthCfg
+		cfg = &MeshAuthCfg{}
 	}
+	a := NewMeshAuth(cfg)
 
 	// Attempt to locate the cert dir.
 	if cfg.CertDir == "" {
 		// Try to find the certificate directory
 		if _, err := os.Stat(filepath.Join("./", "key.pem")); !os.IsNotExist(err) {
 			a.CertDir = "./"
-		} else if _, err := os.Stat(filepath.Join(WorkloadCertDir, privateKey)); !os.IsNotExist(err) {
-			a.CertDir = WorkloadCertDir
+		} else if _, err := os.Stat(filepath.Join(workloadCertDir, privateKey)); !os.IsNotExist(err) {
+			a.CertDir = workloadCertDir
 		} else if _, err := os.Stat(filepath.Join(legacyCertDir, "key.pem")); !os.IsNotExist(err) {
 			a.CertDir = legacyCertDir
 		} else if _, err := os.Stat(filepath.Join("/var/run/secrets/istio", "key.pem")); !os.IsNotExist(err) {
@@ -207,21 +214,6 @@ func FromEnv(cfg *MeshAuthCfg) (*MeshAuth, error) {
 	}
 	if a.CertDir != "" && a.CertDir != "-" {
 		return a, a.initFromDir()
-	}
-
-	if cfg.Name == "" {
-		if os.Getenv("POD_NAME") != "" {
-			cfg.Name = os.Getenv("POD_NAME") + "." + os.Getenv("POD_NAMESPACE")
-		} else {
-			cfg.Name, _ = os.Hostname()
-		}
-	}
-
-	if cfg.TrustDomain == "" {
-		cfg.TrustDomain = os.Getenv("DOMAIN")
-	}
-	if cfg.TrustDomain == "" {
-		cfg.TrustDomain = "cluster.local"
 	}
 
 	return a, nil
@@ -271,7 +263,7 @@ func (a *MeshAuth) initFromCert() {
 	a.PublicKeyBase64 = base64.RawURLEncoding.EncodeToString(a.PublicKey)
 
 	if pk, ok := a.Cert.PrivateKey.(*ecdsa.PrivateKey); ok {
-		a.Priv = pk.D.Bytes()
+		a.ec256Priv = pk.D.Bytes()
 	}
 
 	a.VIP6 = Pub2VIP(a.PublicKey)
@@ -307,12 +299,12 @@ func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 
 // mesh certificates - new style
 const (
-	WorkloadCertDir = "/var/run/secrets/workload-spiffe-credentials"
+	workloadCertDir = "/var/run/secrets/workload-spiffe-credentials"
 
 	// Different from typical Istio  and CertManager key.pem - we can check both
 	privateKey = "private_key.pem"
 
-	WorkloadRootCAs = "ca-certificates.crt"
+	workloadRootCAs = "ca-certificates.crt"
 
 	// Also different, we'll check all. CertManager uses cert.pem
 	cert = "certificates.pem"
@@ -574,7 +566,7 @@ func (a *MeshAuth) initFromDir() error {
 	}
 
 	// Similar with /etc/ssl/certs/ca-certificates.crt - the concatenated list of PEM certs.
-	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, WorkloadRootCAs))
+	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, workloadRootCAs))
 	if rootCertExtra != nil {
 		err2 := a.AddRoots(rootCertExtra)
 		if err2 != nil {
@@ -646,11 +638,11 @@ func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
 // and using hostname as the name.
 func (a *MeshAuth) SaveCerts(outDir string) error {
 	if outDir == "" {
-		outDir = WorkloadCertDir
+		outDir = workloadCertDir
 	}
 	err := os.MkdirAll(outDir, 0755)
 	// TODO: merge other roots as needed - this is Istio XDS server root.
-	rootFile := filepath.Join(outDir, WorkloadRootCAs)
+	rootFile := filepath.Join(outDir, workloadRootCAs)
 	if err != nil {
 		return err
 	}
@@ -719,7 +711,7 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 // This is done by setting "CA_PROVIDER=GoogleGkeWorkloadCertificate" when starting pilot-agent
 func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error {
 	if certDir == "" {
-		certDir = WorkloadCertDir
+		certDir = workloadCertDir
 	}
 	var err error
 	keyFile := filepath.Join(certDir, privateKey)
