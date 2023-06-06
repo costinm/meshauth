@@ -1,9 +1,12 @@
-module github.com/costinm/grpc-mesh/cmd/k8stok
+module github.com/costinm/meshauth/cmd
 
-go 1.19
+go 1.20
+
+replace github.com/costinm/meshauth v0.0.0-20230123031534-9e635566c01e => ../
 
 require (
-	github.com/costinm/meshauth v0.0.0-20230115051703-f145d4074ba3
+	github.com/costinm/meshauth v0.0.0-20230123031534-9e635566c01e
+	golang.org/x/exp v0.0.0-20230522175609-2e198f4a06a1
 	sigs.k8s.io/yaml v1.2.0
 )
 

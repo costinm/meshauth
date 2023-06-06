@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/costinm/meshauth"
 	"sigs.k8s.io/yaml"
@@ -19,10 +20,33 @@ var (
 	fed = flag.Bool("fed", false, "Return the federated token")
 
 	namespace = flag.String("n", "", "Namespace")
+	ksa       = flag.String("ksa", "default", "kubernetes service account")
+
+	certDir = flag.String("outCertDir", "", "Directory to save workload certificates.")
+
+	decode = flag.String("d", "", "Decode token")
 )
 
 func main() {
 	flag.Parse()
+
+	if *decode != "" {
+		fmt.Println(meshauth.TokenPayload(*decode))
+		return
+	}
+
+	home, _ := os.UserHomeDir()
+
+	if *certDir != "" {
+		// Root CA stored in user home, next to .ssh keys
+		ca := meshauth.CAFromEnv(filepath.Join(home, ".ssh"))
+
+		// Create a new mesh identity from the CA.
+		meshid := ca.NewID(*namespace, *ksa)
+
+		meshid.SaveCerts(*certDir)
+		return
+	}
 	kconf, err := LoadKubeconfig()
 	if err != nil {
 		log.Fatal("Can't load kube config file")
