@@ -1,3 +1,3 @@
 module github.com/costinm/meshauth
 
-go 1.19
+go 1.20
