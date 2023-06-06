@@ -2,34 +2,39 @@ package meshauth
 
 import (
 	"crypto/x509"
+	"errors"
 	"net/http"
 )
 
 // Dest represents a destination and associated security info.
-// In Istio this is represented as DestinationRule
+//
+// In Istio this is represented as DestinationRule, Envoy - Cluster.
+//
+// This is primarily concerned with the security aspects (auth, transport),
+// and include 'trusted' attributes from K8S configs or JWT/cert.
 type Dest struct {
+	// Client certificates to use in the request, represented as a MeshAuth object.
+	MeshAuth *MeshAuth
+
 	// BaseAddr is the URL, including any required path prefix, for the destination.
 	BaseAddr string
 
-	// Addr is the IP:port or domainname:port
-	//Addr string
+	// If set, should be used when connecting to the dest
+	SNI string
 
-	// If set, this SAN should be used when connecting to the dest
-	SAN string
+	// If empty, the cluster is using system certs or SPIFFE
+	// Otherwise, it's the configured root certs list, in PEM format.
+	// May include multiple concatenated roots.
+	CACertPEM []byte
 
 	// If set, this is required to verify the certs of dest if https is used
 	// If not set, system certs are used
 	RootCA *x509.CertPool
 
 	// If set, the token source will be used.
-	// Using gRPC interface which returns the full auth strin, not only the token
+	// Using gRPC interface which returns the full auth string, not only the token
+	//
 	TokenSource PerRPCCredentials
-
-	// If set, the workload identity associated with MeshAuth will be used
-	// ( typically client certificate), if the server asks.
-	MeshAuth *MeshAuth
-
-	Transport func(*Dest) http.RoundTripper
 
 	// WebpushPublicKey is the client's public key. From the getKey("p256dh") or keys.p256dh field.
 	// This is used for Dest that accepts messages encrypted using webpush spec, and may
@@ -45,13 +50,35 @@ type Dest struct {
 	WebpushAuth []byte
 }
 
+func (d *Dest) GetCACertPEM() []byte {
+	return d.CACertPEM
+}
+
+func (d *Dest) AddCACertPEM(pems []byte) error {
+	if d.RootCA == nil {
+		d.RootCA = x509.NewCertPool()
+	}
+	if d.CACertPEM != nil {
+		d.CACertPEM = append(d.CACertPEM, '\n')
+		d.CACertPEM = append(d.CACertPEM, pems...)
+	} else {
+		d.CACertPEM = pems
+	}
+	if !d.RootCA.AppendCertsFromPEM(pems) {
+		return errors.New("Failed to decode PEM")
+	}
+	return nil
+}
+
 // H2Client returns an H2C client configured to communicate with the dest.
 func (d *Dest) H2Client() *http.Client {
-	if d.Transport == nil {
+	// Doesn't require TLS client certsor not configured with a plugin
+	if d.MeshAuth == nil || d.MeshAuth.Transport == nil {
+		// TODO: implement
 		return http.DefaultClient
 	}
 	hc := &http.Client{
-		Transport: d.Transport(d),
+		Transport: d.MeshAuth.Transport(d),
 	}
 
 	return hc

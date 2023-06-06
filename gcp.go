@@ -1,3 +1,6 @@
+//go:build !NO_VENDOR
+// +build !NO_VENDOR
+
 package meshauth
 
 import (
@@ -18,28 +21,59 @@ import (
 
 // See golang.org/x/oauth2/google
 
-// JSON key file types.
-const (
-	serviceAccountKey  = "service_account"
-	userCredentialsKey = "authorized_user"
-)
+// Extracted minimal resources to reduce deps.
 
-// credentialsFile is the unmarshalled representation of a credentials file.
-type credentialsFile struct {
-	Type string `json:"type"` // serviceAccountKey or userCredentialsKey
+// Subset of the generated GCP config - to avoid a dependency and bloat.
+// This include just what we need for bootstraping from GKE, Hub or secret store.
+//
+// There are few mechanisms to bootstrap GCP identity:
+// 1. MDS - this is likely best for VM and CR, but on GKE requires annotating the KSA.
+//    It does return a federated access token otherwise - but no ID tokens.
+// 2. Downloaded service account key, with a private key to sign JWTs
+// 3. Gcloud config - returns a user account, can get access tokens and exchange for a GSA
+// 4. Federated - also 'best', starting with a K8S or any other OIDC provider.
+//
+// This file covers 1 and 4. For 2 and 3 - the gcp/ package provides a helper to bootstrap,
+// using the golang oauth2 package as dependency.
 
-	// Service Account fields
-	ClientEmail  string `json:"client_email"`
-	PrivateKeyID string `json:"private_key_id"`
-	PrivateKey   string `json:"private_key"`
-	TokenURL     string `json:"token_uri"`
-	ProjectID    string `json:"project_id"`
+// JWT authentication:
+// For service accounts it is possible to download and upload a public key.
+// Supports RSA in x509 cert for upload.
+// The flow is:
+// - generate a JWT signed by private key - no roundtrip needed
+// - exchange the JWT using the normal process. oauth2.jwt package has example.
+//
 
-	// User Credential fields
-	// (These typically come from gcloud auth.)
-	ClientSecret string `json:"client_secret"`
-	ClientID     string `json:"client_id"`
-	RefreshToken string `json:"refresh_token"`
+// GCPAccessTokenSource creates GCP access tokens for the given GSA. If empty, ASM default service account
+// will be used as long as PROJECT_NUMBER is set.
+func (def *K8SCluster) GCPAccessTokenSource(gsa string) (*GCPAuth, error) {
+	if gsa == "" {
+		// Init a GCP token source - using K8S provider and exchange.
+		// TODO: if we already have a GCP GSA, we can use that directly.
+		projectNumber := def.GetEnv("PROJECT_NUMBER", "")
+		if projectNumber == "" {
+			return nil, errors.New("Missing PROJECT_NUMBER")
+		}
+		gsa = "service-" + projectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
+	}
+
+	// This returns JWT tokens for k8s
+	//audTokenS := k8s.K8sTokenSource{Dest: k8sdefault, Namespace: hb.Namespace,
+	//	KSA: hb.ServiceAccount}
+	fedS := NewFederatedTokenSource(&STSAuthConfig{
+		TrustDomain: def.ProjectID + ".svc.id.goog",
+		TokenSource: &K8sTokenSource{
+			Cluster:   def,
+			Namespace: def.Namespace,
+			KSA:       def.ServiceAccount},
+	})
+
+	audTokenS := NewGCPTokenSource(&GCPAuthConfig{
+		TokenSource: fedS,
+		GSA:         gsa,
+		TrustDomain: def.ProjectID + ".svc.id.goog",
+	})
+	return audTokenS, nil
 }
 
 // STSAuthConfig contains the settings for getting tokens using K8S or federated tokens.
@@ -85,7 +119,7 @@ type GCPAuthConfig struct {
 // The source of trust is the K8S or other IDP token with TrustDomain audience, it is exchanged with
 // access or WorkloadID tokens.
 type GCPAuth struct {
-	httpClient *http.Client
+	httpClient HttpClient
 	cfg        *GCPAuthConfig
 }
 
@@ -106,7 +140,9 @@ var (
 // Otherwise, the gsa must grant the KSA (kubernetes service account)
 // permission to act as the GSA.
 func NewGCPTokenSource(kr *GCPAuthConfig) *GCPAuth {
-
+	if kr == nil {
+		kr = &GCPAuthConfig{}
+	}
 	sts := &GCPAuth{
 		cfg: kr,
 	}
@@ -114,6 +150,7 @@ func NewGCPTokenSource(kr *GCPAuthConfig) *GCPAuth {
 		kr.Scope = gcpScope
 	}
 	sts.httpClient = http.DefaultClient
+
 	if kr.GSA == "" {
 		// use the mesh default SA
 		// If not set, default to ASM default SA.
@@ -134,7 +171,7 @@ func NewGCPTokenSource(kr *GCPAuthConfig) *GCPAuth {
 // WIP - if GOOGLE_APPLICATION_CREDENTIALS is present, load it
 // and use it as a source of access tokens instead of k8s.
 // Same for MDS
-func (gcpa *GCPAuth) LoadManaged() {
+func (gcpa *GCPAuth) loadJWTCredentials() {
 	adc := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
 	if adc != "" {
 		b, err := ioutil.ReadFile(adc)
@@ -194,9 +231,10 @@ func (s *GCPAuth) RequireTransportSecurity() bool {
 // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
 //
 // constructFederatedTokenRequest returns an HTTP request for access token.
+//
 // Example of an access token request:
-// POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/
-// service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
+//
+// POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
 // Content-Type: application/json
 // Authorization: Bearer <federated token>
 //
@@ -214,12 +252,16 @@ func (s *GCPAuth) RequireTransportSecurity() bool {
 //	 --role=roles/iam.workloadIdentityUser \
 //	 --member="serviceAccount:WORKLOAD_IDENTITY_POOL[K8S_NAMESPACE/KSA_NAME]"
 //
-// The p4sa is auto-setup for all authenticated users.
+// This can also be used with user access tokens, if user has
+//
+//	roles/iam.serviceAccountTokenCreator (for iam.serviceAccounts.getOpenIdToken)
+//
+// The p4sa is auto-setup for all authenticated users in ASM.
 func (s *GCPAuth) TokenGSA(ctx context.Context, federatedToken string, audience string) (string, error) {
 	accessToken := audience == "" || s.cfg.UseAccessToken ||
 		strings.Contains(audience, "googleapis.com")
 
-	req, err := s.constructGenerateAccessTokenRequest(federatedToken, audience, accessToken)
+	req, err := s.constructGenerateAccessTokenRequest(ctx, federatedToken, audience, accessToken)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal federated token request: %v", err)
 	}
@@ -270,7 +312,204 @@ func (s *GCPAuth) TokenGSA(ctx context.Context, federatedToken string, audience 
 	return respData.Token, nil
 }
 
-func (s *GCPAuth) constructGenerateAccessTokenRequest(fResp string, audience string, accessToken bool) (*http.Request, error) {
+// Equivalent config using shell:
+//
+//```shell
+//CMD="gcloud container clusters describe ${CLUSTER} --zone=${ZONE} --project=${PROJECT}"
+//
+//K8SURL=$($CMD --format='value(endpoint)')
+//K8SCA=$($CMD --format='value(masterAuth.clusterCaCertificate)' )
+//```
+//
+//```yaml
+//apiVersion: v1
+//kind: Config
+//current-context: my-cluster
+//contexts: [{name: my-cluster, context: {cluster: cluster-1, user: user-1}}]
+//users: [{name: user-1, user: {auth-provider: {name: gcp}}}]
+//clusters:
+//- name: cluster-1
+//  cluster:
+//    server: "https://${K8SURL}"
+//    certificate-authority-data: "${K8SCA}"
+//
+//```
+
+// GKE2RestCluster gets all the clusters for a project, and returns Cluster object.
+func (gcp *GCPAuth) GKEClusters(ctx context.Context, token string, p string) ([]*Dest, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://container.googleapis.com/v1/projects/"+p+"/locations/-/clusters", nil)
+
+	if token != "" {
+		req.Header.Add("authorization", "Bearer "+token)
+	}
+
+	res, err := gcp.httpClient.Do(req)
+	if res.StatusCode != 200 {
+		rd, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%d %s", res.StatusCode, string(rd))
+	}
+	rd, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if Debug {
+		log.Println(string(rd))
+	}
+
+	cl := &Clusters{}
+	err = json.Unmarshal(rd, cl)
+	if err != nil {
+		return nil, err
+	}
+	rcl := []*Dest{}
+
+	for _, c := range cl.Clusters {
+		rc := &Dest{
+			BaseAddr:    "https://" + c.Endpoint + ":443",
+			TokenSource: gcp,
+			//ID:            "gke_" + p + "_" + c.Location + "_" + c.Name,
+		}
+		rc.AddCACertPEM(c.MasterAuth.ClusterCaCertificate)
+
+		rcl = append(rcl, rc)
+	}
+
+	return rcl, err
+}
+
+func (gcp *GCPAuth) HubClusters(ctx context.Context, token string, p string) ([]*Dest, error) {
+	req, _ := http.NewRequest("GET",
+		"https://gkehub.googleapis.com/v1/projects/"+p+"/locations/-/memberships", nil)
+	req = req.WithContext(ctx)
+	if token != "" {
+		req.Header.Add("authorization", "Bearer "+token)
+	}
+
+	res, err := gcp.httpClient.Do(req)
+	if res.StatusCode != 200 {
+		rd, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%d %s", res.StatusCode, string(rd))
+	}
+	rd, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if Debug {
+		log.Println(string(rd))
+	}
+
+	cl := &HubClusters{}
+	err = json.Unmarshal(rd, cl)
+	if err != nil {
+		return nil, err
+	}
+	rcl := []*Dest{}
+
+	for _, hc := range cl.Resources {
+		// hc doesn't provide the endpoint. Need to query GKE - but instead of going over each cluster we can do
+		// batch query on the project and filter.
+		if hc.Endpoint != nil && hc.Endpoint.GkeCluster != nil {
+			ca := hc.Endpoint.GkeCluster.ResourceLink
+			if strings.HasPrefix(ca, "//container.googleapis.com") {
+				rc, err := gcp.GKECluster(ctx, token, ca[len("//container.googleapis.com"):])
+				if err != nil {
+					log.Println("Failed to get ", ca, err)
+				} else {
+					rcl = append(rcl, rc)
+				}
+			}
+		}
+	}
+
+	return rcl, err
+}
+
+// GetCluster returns a cluster config using the GKE API. Path must follow GKE API spec: /projects/P/locations/L/l
+func (gcp *GCPAuth) GKECluster(ctx context.Context, token string, path string) (*Dest, error) {
+	req, _ := http.NewRequest("GET", "https://container.googleapis.com/v1"+path, nil)
+	req = req.WithContext(ctx)
+	if token != "" {
+		req.Header.Add("authorization", "Bearer "+token)
+	}
+
+	res, err := gcp.httpClient.Do(req)
+	if res.StatusCode != 200 {
+		rd, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%d %s", res.StatusCode, string(rd))
+	}
+	rd, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if Debug {
+		log.Println(string(rd))
+	}
+
+	c := &Cluster{}
+	err = json.Unmarshal(rd, c)
+	if err != nil {
+		return nil, err
+	}
+
+	rc := &Dest{
+		BaseAddr:    "https://" + c.Endpoint + ":443",
+		TokenSource: gcp,
+		//ID:            "gke_" + p + "_" + c.Location + "_" + c.Name,
+	}
+	rc.AddCACertPEM(c.MasterAuth.ClusterCaCertificate)
+
+	return rc, err
+}
+
+// Get a GCP secrets - used for bootstraping the credentials and provisioning.
+//
+// Example for creating a secret:
+//
+//	gcloud secrets create ca \
+//	  --data-file <PATH-TO-SECRET-FILE> \
+//	  --replication-policy automatic \
+//	  --project $PROJECT_ID \
+//	  --format json \
+//	  --quiet
+//
+// For MCP/ASM, grant
+// service-$PROJECT_NUMBER@gcp-sa-meshdataplane.iam.gserviceaccount.com
+// secret manager viewer.
+func (gcp *GCPAuth) GetSecret(ctx context.Context, token, p, n, v string) ([]byte, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		"https://secretmanager.googleapis.com/v1/projects/"+p+"/secrets/"+n+
+			"/versions/"+v+":access", nil)
+	req.Header.Add("authorization", "Bearer "+token)
+
+	res, err := gcp.httpClient.Do(req)
+	rd, err := ioutil.ReadAll(res.Body)
+	if res.StatusCode != 200 || err != nil {
+		return nil, errors.New(fmt.Sprintf("Error %d %s", res.StatusCode, string(rd)))
+	}
+
+	var s struct {
+		Payload struct {
+			Data []byte
+		}
+	}
+	err = json.Unmarshal(rd, &s)
+	if err != nil {
+		return nil, err
+	}
+	return s.Payload.Data, err
+}
+
+// https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
+func (s *GCPAuth) constructGenerateAccessTokenRequest(ctx context.Context, fResp string, audience string, accessToken bool) (*http.Request, error) {
 	gsa := s.cfg.GSA
 	endpoint := ""
 	var err error
@@ -300,7 +539,7 @@ func (s *GCPAuth) constructGenerateAccessTokenRequest(fResp string, audience str
 			return nil, fmt.Errorf("failed to marshal query for get access token request: %+v", err)
 		}
 	}
-	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonQuery))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonQuery))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create get access token request: %+v", err)
 	}
@@ -313,16 +552,22 @@ func (s *GCPAuth) constructGenerateAccessTokenRequest(fResp string, audience str
 	return req, nil
 }
 
+// ------------- GCP resources -----------------
+// Extracted minimal resources to reduce deps.
+// This is a subset - rest of fields not used and ignored.
+// The API is expected to remain backward compatible.
+// This includes just what we need for bootstraping from GKE, Hub or secret store.
+
 type accessTokenRequest struct {
 	Name      string   `json:"name"` // nolint: structcheck, unused
-	Delegates []string `json:"delegates"`
+	Delegates []string `json:"delegates,omitempty"`
 	Scope     []string `json:"scope"`
 	LifeTime  Duration `json:"lifetime"` // nolint: structcheck, unused
 }
 
 type idTokenRequest struct {
 	Audience     string   `json:"audience"` // nolint: structcheck, unused
-	Delegates    []string `json:"delegates"`
+	Delegates    []string `json:"delegates,omitempty"`
 	IncludeEmail bool     `json:"includeEmail"`
 }
 
@@ -333,4 +578,99 @@ type accessTokenResponse struct {
 
 type idTokenResponse struct {
 	Token string `json:"token"`
+}
+
+// credentialsFile is the unmarshalled representation of a credentials file.
+type credentialsFile struct {
+	Type string `json:"type"` // serviceAccountKey or userCredentialsKey
+
+	// Service Account fields
+	ClientEmail  string `json:"client_email"`
+	PrivateKeyID string `json:"private_key_id"`
+	PrivateKey   string `json:"private_key"`
+	TokenURL     string `json:"token_uri"`
+	ProjectID    string `json:"project_id"`
+
+	// User Credential fields
+	// (These typically come from gcloud auth.)
+	ClientSecret string `json:"client_secret"`
+	ClientID     string `json:"client_id"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// Clusters return the list of GKE clusters.
+type Clusters struct {
+	Clusters []*Cluster
+}
+
+type Cluster struct {
+	Name string
+
+	// nodeConfig
+	MasterAuth struct {
+		ClusterCaCertificate []byte
+	}
+	Location string
+
+	Endpoint string
+
+	ResourceLabels map[string]string
+
+	// Extras:
+
+	// loggingService, monitoringService
+	//Network string "default"
+	//Subnetwork string
+	ClusterIpv4Cidr  string
+	ServicesIpv4Cidr string
+	// addonsConfig
+	// nodePools
+
+	// For regional clusters - each zone.
+	// For zonal - one entry, equal with location
+	Locations []string
+	// ipAllocationPolicy - clusterIpv4Cider, serviceIpv4Cider...
+	// masterAuthorizedNetworksConfig
+	// maintenancePolicy
+	// autoscaling
+	NetworkConfig struct {
+		// projects/NAME/global/networks/default
+		Network    string
+		Subnetwork string
+	}
+	// releaseChannel
+	// workloadIdentityConfig
+
+	// It seems zone and location are the same for zonal clusters.
+	//Zone string // ex: us-west1
+}
+
+// HubClusters return the list of clusters registered in GKE Hub.
+type HubClusters struct {
+	Resources []HubCluster
+}
+
+type HubCluster struct {
+	// Full name - projects/wlhe-cr/locations/global/memberships/asm-cr
+	//Name     string
+	Endpoint *struct {
+		GkeCluster *struct {
+			// //container.googleapis.com/projects/wlhe-cr/locations/us-central1-c/clusters/asm-cr
+			ResourceLink string
+		}
+		// kubernetesMetadata: vcpuCount, nodeCount, api version
+	}
+	State *struct {
+		// READY
+		Code string
+	}
+
+	Authority struct {
+		Issuer               string `json:"issuer"`
+		WorkloadIdentityPool string `json:"workloadIdentityPool"`
+		IdentityProvider     string `json:"identityProvider"`
+	} `json:"authority"`
+
+	// Membership labels - different from GKE labels
+	Labels map[string]string
 }

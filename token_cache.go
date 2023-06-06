@@ -20,9 +20,10 @@ import (
 	"time"
 )
 
-type cachedToken struct {
-	token      string
-	expiration time.Time
+// Token is a subset of oauth2.Token, to avoid a dep and keep it minimal and WASM-friendly.
+type Token struct {
+	Token  string
+	Expiry time.Time
 }
 
 type TokenCache struct {
@@ -37,9 +38,9 @@ func NewTokenCache(sts func(ctx context.Context, host string) (string, error)) *
 
 func (c *TokenCache) Token(ctx context.Context, host string) (string, error) {
 	if got, f := c.cache.Load(host); f {
-		t := got.(cachedToken)
-		if t.expiration.After(time.Now().Add(-time.Minute)) {
-			return t.token, nil
+		t := got.(Token)
+		if t.Expiry.After(time.Now().Add(-time.Minute)) {
+			return t.Token, nil
 		}
 		// log.Println("Token expired", t.expiration, time.Now(), host)
 	}
@@ -57,7 +58,7 @@ func (c *TokenCache) Token(ctx context.Context, host string) (string, error) {
 	//t := bt[7:]
 	//log.Println("XXX debug Gettoken from metadata", host, k8s.TokenPayload(t), err)
 
-	c.cache.Store(host, cachedToken{t, time.Now().Add(45 * time.Minute)})
+	c.cache.Store(host, Token{t, time.Now().Add(45 * time.Minute)})
 	//log.Println("Storing JWT", host)
 	return t, nil
 }

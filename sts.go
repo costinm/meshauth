@@ -176,8 +176,6 @@ func (s *STS) RequireTransportSecurity() bool {
 	return false
 }
 
-var STSUseJSON = false
-
 // TokenFederated exchanges the K8S JWT with a federated token - an google access token representing
 // the K8S identity (and not a regular GSA!).
 //
@@ -197,9 +195,7 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 	}
 
 	req, err := http.NewRequest("POST", s.cfg.STSEndpoint, bytes.NewBuffer(jsonStr))
-	if !STSUseJSON {
-		req.Header.Add("content-type", "application/x-www-form-urlencoded")
-	}
+	req.Header.Add("content-type", "application/x-www-form-urlencoded")
 	req = req.WithContext(ctx)
 
 	res, err := s.httpClient.Do(req)
@@ -297,23 +293,6 @@ type stsRequestParameters struct {
 // fetchFederatedToken exchanges a third-party issued Json Web Token for an OAuth2.0 access token
 // which asserts a third-party identity within an identity namespace.
 func (s *STS) constructFederatedTokenRequest(aud, jwt string) ([]byte, error) {
-	if STSUseJSON {
-		values := map[string]string{
-			"grantType":          tokenExchangeGrantType, // fixed, no options
-			"subjectTokenType":   subjectTokenTypeJWT,
-			"requestedTokenType": accessTokenType,
-			"audience":           aud, // full name if the identity provider.
-			"subjectToken":       jwt,
-		}
-
-		if s.cfg.Scope != "" {
-			values["scope"] = s.cfg.Scope // required for the GCP exchanges
-		}
-
-		// golang sts also includes:
-		jsonValue, err := json.Marshal(values)
-		return jsonValue, err
-	}
 	data := fmt.Sprintf("grant_type=urn:ietf:params:oauth:grant-type:token-exchange"+
 		"&subject_token_type=urn:ietf:params:oauth:token-type:jwt&"+
 		"requestedTokenType=urn:ietf:params:oauth:token-type:access_token"+
@@ -521,3 +500,55 @@ func (s *STS) sendSuccessfulResponse(w http.ResponseWriter, tokenData []byte) {
 		return
 	}
 }
+
+// ------------ Helpers around TokenSource
+
+type PerRPCCredentialsFromTokenSource struct {
+	TokenSource
+}
+
+func (s *PerRPCCredentialsFromTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	t, err := s.GetToken(ctx, uri[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]string{
+		"authorization": "Bearer: " + t,
+	}, nil
+}
+
+func (s *PerRPCCredentialsFromTokenSource) RequireTransportSecurity() bool { return false }
+
+type StaticTokenSource struct {
+	Token     string
+	TokenFile string
+}
+
+func (s *StaticTokenSource) GetToken(context.Context, string) (string, error) {
+	if s.Token != "" {
+		return s.Token, nil
+	}
+	if s.TokenFile != "" {
+		tfb, err := ioutil.ReadFile(s.TokenFile)
+		if err != nil {
+			return "", err
+		}
+		// TODO: get expiration, cache
+		return string(tfb), nil
+	}
+	return "", nil
+}
+
+func (s *StaticTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	t, err := s.GetToken(ctx, uri[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]string{
+		"authorization": "Bearer: " + t,
+	}, nil
+}
+
+func (s *StaticTokenSource) RequireTransportSecurity() bool { return false }

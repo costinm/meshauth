@@ -14,7 +14,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -29,16 +28,11 @@ import (
 // If it doesn't - it expects to have a KUBECONFIG or ~/.kube/config - or some
 // other mechanism to get the address/credentials.
 type K8SCluster struct {
-	Addr  string
-	Token string
-
-	CACertPEM []byte
+	Dest
 
 	Namespace      string
 	ServiceAccount string
 	Env            map[string]string
-
-	HttpClient HttpClient
 
 	// Location and project are only set for GKE clusters (loaded from mesh config).
 	// For in-cluster - should be injected ?
@@ -47,25 +41,23 @@ type K8SCluster struct {
 	// Basic cluster name - not unique, full ClusterName is based on location and project ClusterName
 	ClusterName string
 
-	Path string
-
-	// TokenProvider is used to get 'admin' tokens (with RBAC permission to get other kinds
-	// of tokens and configs)
-	TokenProvider func(ctx context.Context, aud string) (string, error)
-	Server        string
-	TokenFile     string
+	HttpClient HttpClient
 }
 
 // K8sTokenSource returns K8S JWTs like K8SCluster, but allows overriding
 // the audience, namespace and KSA
 type K8sTokenSource struct {
+	Cluster *K8SCluster
 
 	// Namespace and KSA - the 'cluster' credentials must have the RBAC permissions.
+	// The user in the Cluster is typically admin - or may be the
+	// same user, but have RBAC to call TokenRequest.
 	Namespace, KSA string
 
 	// Force this audience instead of derived from request URI.
+	// Used for connecting to Istiod, CA, google - if empty the
+	// hostname of the dest is used.
 	AudOverride string
-	Cluster     *K8SCluster
 }
 
 type HttpClient interface {
@@ -92,22 +84,21 @@ func (k *K8SCluster) Request(ctx context.Context, ns, kind, name string, postdat
 
 	var req *http.Request
 	if postdata == nil {
-		req, _ = http.NewRequestWithContext(ctx, "GET", k.Server+path, nil)
+		req, _ = http.NewRequestWithContext(ctx, "GET", k.BaseAddr+path, nil)
 	} else {
-		req, _ = http.NewRequestWithContext(ctx, "POST", k.Server+path, bytes.NewReader(postdata))
-	}
-	req.Header.Add("content-type", "application/json")
-	if k.Token != "" {
-		req.Header.Add("authorization", "Bearer "+k.Token)
-	}
-	if k.TokenFile != "" {
-		// TODO: cache the token, check expiration
-		td, err := ioutil.ReadFile(k.TokenFile)
-		if err == nil {
-			req.Header.Add("authorization", "Bearer "+string(td))
-		}
+		req, _ = http.NewRequestWithContext(ctx, "POST", k.BaseAddr+path, bytes.NewReader(postdata))
 	}
 
+	req.Header.Add("content-type", "application/json")
+
+	if k.TokenSource != nil {
+		t, err := k.TokenSource.GetRequestMetadata(ctx, k.BaseAddr)
+		if err == nil {
+			for k, v := range t {
+				req.Header.Add(k, v)
+			}
+		}
+	}
 	return req
 }
 
@@ -296,7 +287,48 @@ func InitK8S(ctx context.Context, kc *KubeConfig) (*K8SCluster, map[string]*K8SC
 		def.ServiceAccount = "default"
 	}
 
+	err = def.LoadMeshEnv(ctx)
+	if err != nil {
+		log.Println("Failed to load mesh env", err)
+		return nil, nil, err
+	}
+
 	return def, extra, nil
+}
+
+func KubeFromEnv(yamlParse func([]byte, interface{}) error) (*K8SCluster, map[string]*K8SCluster, error) {
+	kc, err := LoadKubeconfig(yamlParse)
+	if err != nil {
+		return nil, nil, err
+	}
+	return InitK8S(context.Background(), kc)
+}
+
+func LoadKubeconfig(yamlParse func([]byte, interface{}) error) (*KubeConfig, error) {
+	kc := os.Getenv("KUBECONFIG")
+	if kc == "" {
+		kc = os.Getenv("HOME") + "/.kube/config"
+	}
+	kconf := &KubeConfig{}
+
+	var kcd []byte
+	if kc != "" {
+		if _, err := os.Stat(kc); err == nil {
+			// Explicit kube config, using it.
+			// 	"sigs.k8s.io/yaml"
+			kcd, err = ioutil.ReadFile(kc)
+			if err != nil {
+				return nil, err
+			}
+			err := yamlParse(kcd, kconf)
+			if err != nil {
+				return nil, err
+			}
+
+			return kconf, nil
+		}
+	}
+	return nil, nil
 }
 
 // LoadMeshEnv will load the 'mesh-env' config map in istio-system, and save the
@@ -362,42 +394,6 @@ func (def *K8SCluster) GCPFederatedSource(ctx context.Context) (*STS, error) {
 			KSA:         def.ServiceAccount},
 	})
 	return sts, nil
-}
-
-// GCPAccessTokenSource creates GCP access tokens for the given GSA. If empty, ASM default service account
-// will be used as long as PROJECT_NUMBER is set.
-func (def *K8SCluster) GCPAccessTokenSource(gsa string) (*GCPAuth, error) {
-	if gsa == "" {
-		// Init a GCP token source - using K8S provider and exchange.
-		// TODO: if we already have a GCP GSA, we can use that directly.
-		projectNumber := def.GetEnv("PROJECT_NUMBER", "")
-		if projectNumber == "" {
-			def.LoadMeshEnv(context.Background())
-			projectNumber = def.GetEnv("PROJECT_NUMBER", "")
-		}
-		if projectNumber == "" {
-			return nil, errors.New("Missing PROJECT_NUMBER")
-		}
-		gsa = "service-" + projectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
-	}
-
-	// This returns JWT tokens for k8s
-	//audTokenS := k8s.K8sTokenSource{Dest: k8sdefault, Namespace: hb.Namespace,
-	//	KSA: hb.ServiceAccount}
-	fedS := NewFederatedTokenSource(&STSAuthConfig{
-		TrustDomain: def.ProjectID + ".svc.id.goog",
-		TokenSource: &K8sTokenSource{
-			Cluster:   def,
-			Namespace: def.Namespace,
-			KSA:       def.ServiceAccount},
-	})
-
-	audTokenS := NewGCPTokenSource(&GCPAuthConfig{
-		TokenSource: fedS,
-		GSA:         gsa,
-		TrustDomain: def.ProjectID + ".svc.id.goog",
-	})
-	return audTokenS, nil
 }
 
 // AddKubeConfigClusters extracts supported RestClusters from the kube config, returns the default and the list
@@ -470,29 +466,16 @@ func kubeconfig2Rest(name string, cluster *KubeCluster, user *KubeUser, ns strin
 	if ns == "" {
 		ns = "default"
 	}
-	u, err := url.Parse(cluster.Server)
-	h := u.Hostname()
-	p := u.Port()
-	if err != nil {
-		return nil, err
-	}
-	if p == "" {
-		p = "443"
-	}
-	prefix := "http://"
-	if p == "443" || cluster.CertificateAuthority != "" || cluster.CertificateAuthorityData != "" {
-		prefix = "https://"
-	}
 	rc := &K8SCluster{
-		Server: cluster.Server,
-		Addr:   prefix + net.JoinHostPort(h, p),
-		Path:   u.Path,
+		Dest: Dest{
+			BaseAddr: cluster.Server,
+		},
 	}
 	if user.Token != "" {
-		rc.Token = user.Token
+		rc.TokenSource = &StaticTokenSource{Token: user.Token}
 	}
 	if user.TokenFile != "" {
-		rc.TokenFile = user.TokenFile
+		rc.TokenSource = &StaticTokenSource{TokenFile: user.TokenFile}
 	}
 
 	parts := strings.Split(name, "_")
@@ -550,45 +533,42 @@ func kubeconfig2Rest(name string, cluster *KubeCluster, user *KubeUser, ns strin
 }
 
 func inCluster() (*K8SCluster, error) {
-	host := os.Getenv("KUBERNETES_SERVICE_HOST")
-	if host != "" {
-		const (
-			tokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-			rootCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-		)
-		host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
-		if len(host) == 0 || len(port) == 0 {
-			return nil, nil
-		}
-
-		token, err := ioutil.ReadFile(tokenFile)
-		if err != nil {
-			return nil, err
-		}
-
-		ca, err := ioutil.ReadFile(rootCAFile)
-		c := &K8SCluster{
-			Addr:        net.JoinHostPort(host, port),
-			Server:      "https://" + net.JoinHostPort(host, port),
-			ClusterName: "k8s",
-			TokenFile:   tokenFile,
-			CACertPEM:   ca,
-		}
-
-		namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-		if err == nil {
-			c.Namespace = string(namespace)
-		}
-
-		jwt := DecodeJWT(string(token))
-		if c.Namespace == "" {
-			c.Namespace = jwt.K8S.Namespace
-		}
-		if c.ServiceAccount == "" {
-			c.ServiceAccount = jwt.Name
-		}
-
-		return c, nil
+	const (
+		tokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		rootCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	)
+	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
+	if len(host) == 0 || len(port) == 0 {
+		return nil, nil
 	}
-	return nil, nil
+
+	token, err := ioutil.ReadFile(tokenFile)
+	if err != nil {
+		return nil, err
+	}
+
+	ca, err := ioutil.ReadFile(rootCAFile)
+
+	c := &K8SCluster{
+		Dest: Dest{
+			BaseAddr:    "https://" + net.JoinHostPort(host, port),
+			TokenSource: &StaticTokenSource{TokenFile: tokenFile}},
+		ClusterName: "k8s",
+	}
+	c.Dest.AddCACertPEM(ca)
+
+	namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err == nil {
+		c.Namespace = string(namespace)
+	}
+
+	jwt := DecodeJWT(string(token))
+	if c.Namespace == "" {
+		c.Namespace = jwt.K8S.Namespace
+	}
+	if c.ServiceAccount == "" {
+		c.ServiceAccount = jwt.Name
+	}
+
+	return c, nil
 }

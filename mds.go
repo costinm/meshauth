@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // mds is the 'metadata service' - running on the node
@@ -18,6 +20,10 @@ import (
 // The server side emulates a GCP MDS. Client side defaults to an GCP
 // style MDS. Other servers may be emulated - but current gRPC libraries
 // and envoy use this.
+
+// MDS also supports a 'Subscribe' call: mds.Subscribe(suffix, fn(string, ok).
+// based on ?wait_for_change=true&last_etag=ETAG
+// Metadata package uses suffix past /v1/ in the interfaces.
 
 const (
 	metaPrefix     = "/computeMetadata/v1"
@@ -33,16 +39,21 @@ const (
 // MDS represents the workload metadata.
 // It is extracted from environment: env variables, mesh config, local metadata server.
 type MDS struct {
-	// Addr is the address of the MDS server to use, including http:// or https://
-	Addr string
+	// Certificate and client factory.
+	MeshAuth *MeshAuth
 
-	// TokenSource is used when running an MDS proxy - it is used to get the actual tokens.
-	TokenSource TokenSource
+	// Addr is the address of the MDS server, including http:// or https://
+	// Will detect a GCP/GKE server
+	Addr string
 
 	// For GCP MDS, request the full token content.
 	UseMDSFullToken bool
 
-	MeshAuth *MeshAuth
+	Meta sync.Map
+}
+
+func NewMDS() *MDS {
+	return &MDS{}
 }
 
 // Determine the workload name, using environment variables or hostname.
@@ -91,7 +102,7 @@ func (s *MDS) GetRequestMetadata(ctx context.Context, aud ...string) (map[string
 	return md(t), nil
 }
 
-// Get an WorkloadID token from platform (GCP, etc)
+// Get an WorkloadID token from platform (GCP, etc) using metadata server.
 //
 //	curl  -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=[AUDIENCE]" \
 //
@@ -102,7 +113,7 @@ func (s *MDS) GetToken(ctx context.Context, aud string) (string, error) {
 	if s.UseMDSFullToken { // TODO: test the difference
 		uri = uri + "&format=full"
 	}
-	tok, err := s.MetadataGet(ctx, uri)
+	tok, err := s.MetadataGet(uri)
 	if err != nil {
 		return "", err
 	}
@@ -111,6 +122,25 @@ func (s *MDS) GetToken(ctx context.Context, aud string) (string, error) {
 
 func (s *MDS) RequireTransportSecurity() bool {
 	return false
+}
+
+func (s *MDS) ProjectID() string {
+	pidA, _ := s.Meta.Load(projIDPath)
+	if pidA != "" {
+		return pidA.(string)
+	}
+
+	pid, _ := s.MetadataGet(projIDPath)
+	if pid != "" {
+		return pid
+	}
+
+	pid = os.Getenv("PROJECT_ID")
+	if pid != "" {
+		return pid
+	}
+
+	return ""
 }
 
 // GetMDS returns MDS info:
@@ -124,7 +154,9 @@ func (s *MDS) RequireTransportSecurity() bool {
 // instance/service-accounts/ - default, PROJECTID.svc.id.goog
 // instance/service-accounts/default/identity - requires the iam.gke.io/gcp-service-account=gsa@project annotation and IAM
 // instance/service-accounts/default/token - access token for the KSA
-func (m *MDS) MetadataGet(ctx context.Context, path string) (string, error) {
+func (m *MDS) MetadataGet(path string) (string, error) {
+	ctx, cf := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cf()
 	if m.Addr == "" {
 		mdsHost := os.Getenv("GCE_METADATA_HOST")
 		if mdsHost == "" {

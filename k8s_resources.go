@@ -301,16 +301,12 @@ func (t Time) MarshalJSON() ([]byte, error) {
 
 type Secret struct {
 	ObjectMeta
-
-	//ApiVersion string            `json:"apiVersion"`
 	Data map[string][]byte `json:"data"`
-	//Kind       string            `json:"kind"`
 }
 
 type ConfigMap struct {
-	ApiVersion string            `json:"apiVersion"`
-	Data       map[string]string `json:"data"`
-	Kind       string            `json:"kind"`
+	ObjectMeta
+	Data map[string]string `json:"data"`
 }
 
 type CreateTokenResponseStatus struct {

@@ -40,8 +40,9 @@ const (
 // cert-chain.pem - will be appended to all generated certificates - should be a chain path to the root, not including ca-cert
 // ca-cert.pem - the root key (top root)
 type CA struct {
-	Private     *rsa.PrivateKey
-	CACert      *x509.Certificate
+	Private *rsa.PrivateKey
+	CACert  *x509.Certificate
+
 	TrustDomain string
 	prefix      string
 	CACertPEM   []byte

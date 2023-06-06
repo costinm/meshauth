@@ -86,8 +86,15 @@ type MeshAuthCfg struct {
 // mesh-compatible security. Includes helpers for authentication and basic provisioning.
 //
 // By default it will attempt to load a workload cert, and extract info from the cert.
+//
+// A workload may be associated with multiple service accounts and identity providers, and
+// may have multiple certificates.
 type MeshAuth struct {
 	*MeshAuthCfg
+
+	// Transport is a function that returns a round tripper for the destination.
+	// Used to avoid direct dep to H2 library.
+	Transport func(*Dest) http.RoundTripper
 
 	// Primary certificate and private key. Loaded or generated.
 	Cert *tls.Certificate
@@ -131,6 +138,7 @@ type MeshAuth struct {
 
 	AuthProviders map[string]TokenSource
 
+	// Metadata about this node.
 	MDS *MDS
 }
 
@@ -138,6 +146,12 @@ type MeshAuth struct {
 type TokenSource interface {
 	// GetToken for a given audience.
 	GetToken(context.Context, string) (string, error)
+}
+
+type TokenSourceFunc func(context.Context, string) (string, error)
+
+func (f TokenSourceFunc) GetToken(ctx context.Context, aud string) (string, error) {
+	return f(ctx, aud)
 }
 
 // PerRPCCredentials defines the common interface for the credentials which need to
@@ -162,6 +176,7 @@ type PerRPCCredentials interface {
 }
 
 // NewMeshAuth creates the auth object, without any certifcates.
+//
 // Must call SetTLSCertificate to initialize or one of the methods that finds or generates the cert.
 func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 	if cfg == nil {
@@ -172,6 +187,7 @@ func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 		MeshAuthCfg:     cfg,
 		CertMap:         map[string]*tls.Certificate{},
 		MDS:             &MDS{},
+		AuthProviders:   map[string]TokenSource{},
 	}
 	a.MDS.MeshAuth = a
 	return a
@@ -756,7 +772,11 @@ func (a *MeshAuth) WorkloadID() string {
 	return su.String()
 }
 
+// String returns a json representation of mesh auth.
 func (a *MeshAuth) String() string {
+	if a.Cert == nil || len(a.Cert.Certificate) == 0 {
+		return "{}"
+	}
 	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
 	if err != nil {
 		return ""
@@ -765,7 +785,7 @@ func (a *MeshAuth) String() string {
 	if len(cert.URIs) > 0 {
 		id = cert.URIs[0].String()
 	}
-	return fmt.Sprintf("WorkloadID=%s,iss=%s,exp=%v,org=%s", id, cert.Issuer,
+	return fmt.Sprintf(`{"id":"%s"","iss":"%s","exp":"%v","org":"%s"}`, id, cert.Issuer,
 		cert.NotAfter, cert.Subject.Organization)
 }
 
