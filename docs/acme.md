@@ -50,6 +50,86 @@ If a 'regular ACME' server is used, the first steps of the protocol will be perf
 plane. The workload agent should only issue the final request. For a 'mesh-aware' ACME server that
 is integrated with the mesh IDP, the final request should be issued directly to the ACME server.
 
+The CSR is sent as DER encoded in base64 URL - different from PEM.
+
+```text
+   POST /acme/order/TOlocE8rfgo/finalize HTTP/1.1
+   Host: example.com
+   Content-Type: application/jose+json
+
+   {
+     "protected": base64url({
+       "alg": "ES256",
+       "kid": "https://example.com/acme/acct/evOfKhNU60wg",
+       "nonce": "MSF2j2nawWHPxxkE3ZJtKQ",
+       "url": "https://example.com/acme/order/TOlocE8rfgo/finalize"
+     }),
+     "payload": base64url({
+       "csr": "MIIBPTCBxAIBADBFMQ...FS6aKdZeGsysoCo4H9P",
+     }),
+     "signature": "uOrUfIIk5RyQ...nw62Ay1cl6AB"
+   }
+
+   HTTP/1.1 200 OK
+   Replay-Nonce: CGf81JWBsq8QyIgPCi9Q9X
+   Link: <https://example.com/acme/directory>;rel="index"
+   Location: https://example.com/acme/order/TOlocE8rfgo
+
+   {
+     "status": "valid",
+     "expires": "2016-01-20T14:09:07.99Z",
+
+     "notBefore": "2016-01-01T00:00:00Z",
+     "notAfter": "2016-01-08T00:00:00Z",
+
+     "identifiers": [
+       { "type": "dns", "value": "www.example.org" },
+       { "type": "dns", "value": "example.org" }
+     ],
+
+     "authorizations": [
+       "https://example.com/acme/authz/PAniVnsZcis",
+       "https://example.com/acme/authz/r4HqLzrSrpI"
+     ],
+
+     "finalize": "https://example.com/acme/order/TOlocE8rfgo/finalize",
+
+     "certificate": "https://example.com/acme/cert/mAt3xBGaobw"
+   }
+```
+```text
+
+   POST /acme/cert/mAt3xBGaobw HTTP/1.1
+   Host: example.com
+   Content-Type: application/jose+json
+   Accept: application/pem-certificate-chain
+
+   {
+     "protected": base64url({
+       "alg": "ES256",
+       "kid": "https://example.com/acme/acct/evOfKhNU60wg",
+       "nonce": "uQpSjlRb4vQVCjVYAyyUWg",
+       "url": "https://example.com/acme/cert/mAt3xBGaobw"
+     }),
+     "payload": "",
+     "signature": "nuSDISbWG8mMgE7H...QyVUL68yzf3Zawps"
+   }
+
+   HTTP/1.1 200 OK
+   Content-Type: application/pem-certificate-chain
+   Link: <https://example.com/acme/directory>;rel="index"
+
+   -----BEGIN CERTIFICATE-----
+   [End-entity certificate contents]
+   -----END CERTIFICATE-----
+   -----BEGIN CERTIFICATE-----
+   [Issuer certificate contents]
+   -----END CERTIFICATE-----
+   -----BEGIN CERTIFICATE-----
+   [Other certificate contents]
+   -----END CERTIFICATE-----
+```
+
 ## Prototype
 
 WIP - this can be implemented without any other deps, reusing the Webpush JWK code. 
