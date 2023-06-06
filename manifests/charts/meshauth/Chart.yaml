@@ -1,0 +1,7 @@
+apiVersion: v1
+name: meshauth
+version: 0.1.1
+description: Minimal CA and per node MDS
+keywords:
+  - meshauth
+engine: gotpl

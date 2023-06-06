@@ -1,0 +1,3 @@
+# Cloudrun deployment for a minimal self-contained mesh environment.
+#
+# Multiple containers are co-located with an envoy gateway.
