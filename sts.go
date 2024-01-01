@@ -25,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // From nodeagent/plugin/providers/google/stsclient
@@ -33,7 +34,7 @@ var (
 	// secureTokenEndpoint is the Endpoint the STS client calls to.
 	secureTokenEndpoint = "https://sts.googleapis.com/v1/token"
 
-	gcpScope = "https://www.googleapis.com/auth/cloud-platform"
+	GCP_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 	// urlEncodedForm is the encoding type specified in a STS request.
 	urlEncodedForm = "application/x-www-form-urlencoded"
@@ -98,7 +99,7 @@ type STS struct {
 
 func NewSTS(kr *STSAuthConfig) *STS {
 	if kr.Scope == "" {
-		kr.Scope = gcpScope
+		kr.Scope = GCP_SCOPE
 	}
 	if kr.STSEndpoint == "" {
 		kr.STSEndpoint = secureTokenEndpoint
@@ -117,7 +118,7 @@ func NewSTS(kr *STSAuthConfig) *STS {
 // https://cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token
 func NewFederatedTokenSource(kr *STSAuthConfig) *STS {
 	if kr.Scope == "" {
-		kr.Scope = gcpScope
+		kr.Scope = GCP_SCOPE
 	}
 	if kr.STSEndpoint == "" {
 		kr.STSEndpoint = secureTokenEndpoint
@@ -130,7 +131,7 @@ func NewFederatedTokenSource(kr *STSAuthConfig) *STS {
 	}
 }
 
-func md(t string) map[string]string {
+func ToMeta(t string) map[string]string {
 	res := map[string]string{
 		"authorization": "Bearer " + t,
 	}
@@ -151,7 +152,7 @@ func (s *STS) GetRequestMetadata(ctx context.Context, aud ...string) (map[string
 	if err != nil {
 		return nil, err
 	}
-	return md(t), nil
+	return ToMeta(t), nil
 }
 
 func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
@@ -207,7 +208,7 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("token exchange read failed: %v, (aud: %s, STS endpoint: %s)", err, stsAud, s.cfg.STSEndpoint)
 	}
-	respData := &federatedTokenResponse{}
+	respData := &TokenResponse{}
 	if err := json.Unmarshal(body, respData); err != nil {
 		// Normally the request should json - extremely hard to debug otherwise, not enough info in status/err
 		log.Println("Unexpected unmarshal error, response was ", string(body))
@@ -221,13 +222,6 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 	}
 
 	return respData.AccessToken, nil
-}
-
-type federatedTokenResponse struct {
-	AccessToken     string `json:"access_token"`
-	IssuedTokenType string `json:"issued_token_type"`
-	TokenType       string `json:"token_type"`
-	ExpiresIn       int64  `json:"expires_in"` // Expiration time in seconds
 }
 
 // provider can be extracted from metadata server, or is set using GKE_ClusterURL
@@ -368,10 +362,10 @@ func (s *STS) unmarshallTokenRequest(req *http.Request) (*stsRequestParameters, 
 
 // From stsservice/sts.go
 
-// stsResponseParameters stores all attributes sent as JSON in a successful STS
+// TokenResponse stores all attributes sent as JSON in a successful STS
 // response. These attributes are defined in
 // https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16#section-2.2.1
-type stsResponseParameters struct {
+type TokenResponse struct {
 	// REQUIRED. The security token issued by the authorization server
 	// in response to the token exchange request.
 	AccessToken string `json:"access_token"`
@@ -384,6 +378,7 @@ type stsResponseParameters struct {
 	// RECOMMENDED. The validity lifetime, in seconds, of the token issued by the
 	// authorization server.
 	ExpiresIn int64 `json:"expires_in"`
+
 	// OPTIONAL, if the Scope of the issued security token is identical to the
 	// Scope requested by the client; otherwise, REQUIRED.
 	Scope string `json:"scope"`
@@ -447,7 +442,7 @@ func (p *STS) generateSTSRespInner(token string) []byte {
 	//if err == nil {
 	//	expireInSec = int64(time.Until(exp).Seconds())
 	//}
-	stsRespParam := stsResponseParameters{
+	stsRespParam := TokenResponse{
 		AccessToken:     token,
 		IssuedTokenType: accessTokenType,
 		TokenType:       "Bearer",
@@ -514,21 +509,25 @@ func (s *PerRPCCredentialsFromTokenSource) GetRequestMetadata(ctx context.Contex
 	}
 
 	return map[string]string{
-		"authorization": "Bearer: " + t,
+		"authorization": "Bearer " + t,
 	}, nil
 }
 
 func (s *PerRPCCredentialsFromTokenSource) RequireTransportSecurity() bool { return false }
 
-type StaticTokenSource struct {
+// File or static token source
+type FileTokenSource struct {
 	Token     string
 	TokenFile string
+	Exp       time.Time
 }
 
-func (s *StaticTokenSource) GetToken(context.Context, string) (string, error) {
+func (s *FileTokenSource) GetToken(context.Context, string) (string, error) {
 	if s.Token != "" {
 		return s.Token, nil
 	}
+
+	// TODO: if expired, read from file again
 	if s.TokenFile != "" {
 		tfb, err := ioutil.ReadFile(s.TokenFile)
 		if err != nil {
@@ -540,15 +539,15 @@ func (s *StaticTokenSource) GetToken(context.Context, string) (string, error) {
 	return "", nil
 }
 
-func (s *StaticTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+func (s *FileTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
 	t, err := s.GetToken(ctx, uri[0])
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]string{
-		"authorization": "Bearer: " + t,
+		"authorization": "Bearer " + t,
 	}, nil
 }
 
-func (s *StaticTokenSource) RequireTransportSecurity() bool { return false }
+func (s *FileTokenSource) RequireTransportSecurity() bool { return false }

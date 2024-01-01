@@ -85,7 +85,7 @@ func WebpushSubscriptionToDest(b []byte) (*Dest, error) {
 		return nil, err
 	}
 
-	return &Dest{BaseAddr: sub.Endpoint, WebpushPublicKey: key, WebpushAuth: auth}, nil
+	return &Dest{Addr: sub.Endpoint, WebpushPublicKey: key, WebpushAuth: auth}, nil
 }
 
 // NewWebpushEncryption creates a new encryption context for sending, based on the subscription pub key and auth.

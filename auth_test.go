@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-// TODO: move the old tests for auth here.
-
 const (
 	testpriv = "bSaKOws92sj2DdULvWSRN3O03a5vIkYW72dDJ_TIFyo"
 	testpub  = "BALVohWt4pyr2L9iAKpJig2mJ1RAC1qs5CGLx4Qydq0rfwNblZ5IJ5hAC6-JiCZtwZHhBlQyNrvmV065lSxaCOc"
@@ -22,7 +20,7 @@ const (
 
 func TestVapid(t *testing.T) {
 	rfcEx := "vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczovL3B1c2guZXhhbXBsZS5uZXQiLCJleHAiOjE0NTM1MjM3NjgsInN1YiI6Im1haWx0bzpwdXNoQGV4YW1wbGUuY29tIn0.i3CYb7t4xfxCDquptFOepC9GAu_HLGkMlMuCGSK2rpiUfnK9ojFwDXb1JrErtmysazNjjvW2L9OkSSHzvoD1oA, " +
-			"k=BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
+		"k=BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
 
 	rfcT, rfcP, err := CheckVAPID(rfcEx, time.Time{})
 	if err != nil {
@@ -35,7 +33,9 @@ func TestVapid(t *testing.T) {
 	}
 	log.Println(len(rfcP), rfcT)
 
-	alice := NewMeshAuth(&MeshAuthCfg{TrustDomain: "test.sender"}).InitSelfSigned("")
+	alice := NewMeshAuth(&MeshAuthCfg{
+		TrustDomain: "test.sender"}).InitSelfSigned("")
+
 	bobToken := alice.VAPIDToken("bob")
 	log.Println("Authorization: " + bobToken)
 

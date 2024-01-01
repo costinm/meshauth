@@ -1,17 +1,17 @@
 package meshauth
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
 
-// Auth in hbone is primarily mTLS-based, but in some cases JWTs are used.
-// Few minimal helper functions to avoid deps and handle k8s-specific variant.
+// Few minimal helper functions to avoid deps and handle k8s-specific variants.
+// Goal is to also compile to WASM - common library is go-jose.
+//
 
+// First part of the token.
 type JWTHead struct {
 	Typ string `json:"typ"`
 	Alg string `json:"alg,omitempty"`
@@ -32,6 +32,8 @@ type JWT struct {
 	//include a "sub" (Subject) claim in the JWT.  The "sub" claim SHOULD
 	//include a contact URI for the application server as either a
 	//"mailto:" (email) [RFC6068] or an "https:" [RFC2818] URI.
+	//
+	// For K8S, system:serviceaccount:NAMESPACE:KSA
 	Sub string `json:"sub,omitempty"`
 
 	// Max 24h
@@ -45,11 +47,25 @@ type JWT struct {
 
 	EmailVerified bool `json:"email_verified,omitempty"`
 
+	//  \"kubernetes.io\":{\"namespace\":\"default\",\"serviceaccount\":{\"name\":\"default\",
+	// \"uid\":\"a47d63f6-29a4-4e95-94a6-35e39ee6d77c\"}},
 	K8S K8SAccountInfo `json:"kubernetes.io"`
 
 	Name string `json:"kubernetes.io/serviceaccount/service-account.name"`
 
 	Raw string `json:"-"`
+}
+
+func (j *JWT) KSA() (string, string) {
+	if !strings.HasPrefix(j.Sub, "system:serviceaccount") {
+		return "", ""
+	}
+
+	parts := strings.Split(j.Sub, ":")
+	if len(parts) < 4 {
+		return "", ""
+	}
+	return parts[2], parts[3]
 }
 
 type K8SAccountInfo struct {
@@ -114,47 +130,65 @@ func DecodeJWT(jwt string) *JWT {
 	return j
 }
 
+// JwtRawParse will parse the JWT and extract the elements.
+// WILL NOT VERIFY.
+// From go-oidc/verify.go
 func JwtRawParse(tok string) (head *JWTHead, jwt *JWT, payload []byte, sig []byte, err error) {
 	// Token is parsed with square/go-jose
 	parts := strings.Split(tok, ".")
 	if len(parts) < 2 {
-		return nil, nil, nil, nil, fmt.Errorf("VAPID: malformed jwt, parts=%d", len(parts))
+		return nil, nil, nil, nil, fmt.Errorf("malformed jwt, parts=%d", len(parts))
 	}
+
 	headRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("malformed jwt[0] %v %s", err, parts[0])
+		//log.Println("malformed jwt[0]", err, parts[0], string(headRaw))
 	}
+
 	h := &JWTHead{}
-	json.Unmarshal(headRaw, h)
+	err = json.Unmarshal(headRaw, h)
+	if err != nil {
+		//log.Println("malformed json jwt[0]", err, string(headRaw))
+		return nil, nil, nil, nil, fmt.Errorf("malformed json on jwt[0] %v %s", err, parts[0])
+	}
 
 	payload, err = base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("malformed jwt[1] %v %s", err, parts[1])
 	}
 	b := &JWT{}
-	json.Unmarshal(payload, b)
+	err = json.Unmarshal(payload, b)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("malformed json jwt[1] %v %s", err, parts[1])
+	}
 	b.Raw = string(payload)
 
-	sig, err = base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("VAPI: malformed jwt %v", err)
+	if len(parts) > 2 {
+		sig, _ = base64.RawURLEncoding.DecodeString(parts[2])
+		// Allow invalid / missing signature - verify will check if needed
+		// In some cases the gateway will wipe the sig.
 	}
-
 	return h, b, []byte(tok[0 : len(parts[0])+len(parts[1])+1]), sig, nil
 }
 
-type FileTokenSource struct {
-	File  string
-	Token string
-	Exp   time.Time
+// checkAudience() returns true if the audiences to check are in
+// the expected audiences. Otherwise, return false.
+func (j *JWT) CheckAudience(audExpected []string) bool {
+	for _, a := range j.Aud {
+		for _, b := range audExpected {
+			if a == b {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-func (f *FileTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return map[string]string{
-		"authorization": "bearer " + f.Token,
-	}, nil
-}
-
-func (f *FileTokenSource) RequireTransportSecurity() bool {
-	return true
+func (j *JWT) K8SInfo() (string, string) {
+	if strings.HasPrefix(j.Sub, "system:serviceaccount:") {
+		parts := strings.Split(j.Sub, ":")
+		return parts[2], parts[3]
+	}
+	return "", ""
 }

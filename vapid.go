@@ -128,6 +128,11 @@ func jwtParseAndCheckSig(tok string, pk crypto.PublicKey) (*JWT, error) {
 		return nil, err
 	}
 
+	return JWTVerify(h, b, txt, sig, pk)
+}
+
+// JWTVerify will verify "txt" using a public key or other verifiers.
+func JWTVerify(h *JWTHead, b *JWT, txt []byte, sig []byte, pk crypto.PublicKey) (*JWT, error) {
 	hasher := crypto.SHA256.New()
 	hasher.Write(txt)
 
@@ -147,7 +152,7 @@ func jwtParseAndCheckSig(tok string, pk crypto.PublicKey) (*JWT, error) {
 	} else if h.Alg == "RS256" {
 		rsak := pk.(*rsa.PublicKey)
 		hashed := hasher.Sum(nil)
-		err = rsa.VerifyPKCS1v15(rsak, crypto.SHA256, hashed, sig)
+		err := rsa.VerifyPKCS1v15(rsak, crypto.SHA256, hashed, sig)
 		if err != nil {
 			return nil, err
 		}
@@ -175,7 +180,6 @@ func CheckVAPID(tok string, now time.Time) (jwt *JWT, pub []byte, err error) {
 		return nil, nil, errors.New("Unexected scheme " + scheme)
 	}
 
-	tok = keys["t"]
 	pubk := keys["k"]
 
 	publicUncomp, err := base64.RawURLEncoding.DecodeString(pubk)
@@ -193,6 +197,7 @@ func CheckVAPID(tok string, now time.Time) (jwt *JWT, pub []byte, err error) {
 		return nil, nil, fmt.Errorf("VAPI: malformed jwt %d", len(pubk))
 	}
 
+	tok = keys["t"]
 	b, err := jwtParseAndCheckSig(tok, pk)
 	if err != nil {
 		return nil, nil, err

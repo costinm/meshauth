@@ -28,12 +28,13 @@ type Token struct {
 
 type TokenCache struct {
 	cache sync.Map
-	sts   func(ctx context.Context, host string) (string, error)
-	m     sync.Mutex
+
+	STS func(ctx context.Context, host string) (string, error)
+	m   sync.Mutex
 }
 
 func NewTokenCache(sts func(ctx context.Context, host string) (string, error)) *TokenCache {
-	return &TokenCache{sts: sts}
+	return &TokenCache{STS: sts}
 }
 
 func (c *TokenCache) Token(ctx context.Context, host string) (string, error) {
@@ -42,23 +43,14 @@ func (c *TokenCache) Token(ctx context.Context, host string) (string, error) {
 		if t.Expiry.After(time.Now().Add(-time.Minute)) {
 			return t.Token, nil
 		}
-		// log.Println("Token expired", t.expiration, time.Now(), host)
 	}
 
-	//t, err := c.sts.GetRequestMetadata(ctx, host)
-	t, err := c.sts(ctx, host)
+	t, err := c.STS(ctx, host)
 
 	if err != nil {
 		return "", err
 	}
-	//bt := mt["authorization"]
-	//if !strings.HasPrefix(bt, "Bearer ") {
-	//	return "", errors.New("Invalid prefix")
-	//}
-	//t := bt[7:]
-	//log.Println("XXX debug Gettoken from metadata", host, k8s.TokenPayload(t), err)
 
 	c.cache.Store(host, Token{t, time.Now().Add(45 * time.Minute)})
-	//log.Println("Storing JWT", host)
 	return t, nil
 }

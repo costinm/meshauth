@@ -159,7 +159,7 @@ func Test2Way(t *testing.T) {
 	subPriv, subPub, err := randomKey()
 	auth, err := b64.DecodeString("68zcbmaevQa7MS7aXXRX8Q")
 	sub := &Dest{
-		BaseAddr:         "https://foo.com",
+		Addr:             "https://foo.com",
 		WebpushAuth:      auth,
 		WebpushPublicKey: subPub,
 	}
@@ -195,13 +195,11 @@ func TestWebpush(t *testing.T) {
 	authB, _ := base64.RawURLEncoding.DecodeString(auths)
 	rpriv := "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94"
 	rpub := "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
-	rv := NewMeshAuth(nil)
-	rv.SetVapid(rpub, rpriv)
+	rv := NewMeshAuth(&MeshAuthCfg{EC256Pub: rpub, EC256Key: rpriv})
 
 	spriv := "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"
 	spub := "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
-	sv := NewMeshAuth(nil)
-	sv.SetVapid(spub, spriv)
+	sv := NewMeshAuth(&MeshAuthCfg{EC256Pub: spub, EC256Key: spriv})
 
 	plain := "When I grow up, I want to be a watermelon"
 

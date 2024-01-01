@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"io/ioutil"
 	"math/big"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,30 +35,69 @@ const (
 // - direct - using istio-ca-secret.istio-system secret
 // - intermediate - using cacerts.istio-system
 //
-// Istio stores the files in /etc/cacerts - there are 3 or 4 files:
+// Istio used to stores the files in /etc/cacerts - there are 3 or 4 files:
 // ca-key.pem - root or intermediary key
 // ca-cert.pem - single certificate associated with ca-key.
 // cert-chain.pem - will be appended to all generated certificates - should be a chain path to the root, not including ca-cert
 // ca-cert.pem - the root key (top root)
+//
+// More recent versions of Istio are compatible with CertManager.
 type CA struct {
-	Private *rsa.PrivateKey
-	CACert  *x509.Certificate
+	Config *CAConfig
+
+	Private crypto.PrivateKey
+
+	CACert *x509.Certificate
 
 	TrustDomain string
 	prefix      string
-	CACertPEM   []byte
+
+	IntermediatesPEM []byte
+
+	// Root certs
+	CACertPEM []byte
+
+	KeyType string
+
+	ExtraKeyProvider func(public interface{}, id string, secret *Secret)
 }
 
-// NewCA creates a new CA and loads the certificates.
-func NewCA(trust string) *CA {
-	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
+type CAConfig struct {
+	// TrustDomain to use in certs.
+	// Should not be 'cluster.local' - but a real FQDN
+	TrustDomain string
+
+	// Location of the CA root - currently a dir path.
+	//
+	RootLocation string
+
+	// TODO: additional configs/policies.
+}
+
+// NewCA creates a new CA. Keys must be loaded.
+func NewCA(cfg *CAConfig) *CA {
+	ca := &CA{Config: cfg}
+	ca.prefix = "spiffe://" + cfg.TrustDomain + "/ns/"
+	return ca
+}
+
+// NewTempCA creates a temporary/test CA.
+func NewTempCA(trust string) *CA {
 	if trust == "" {
 		trust = "cluster.local"
 	}
-	caCert, caCertPEM := rootCert(trust, "rootCA", ca, ca)
-	return &CA{Private: ca, CACert: caCert, CACertPEM: caCertPEM, TrustDomain: trust,
-		prefix: "spiffe://" + trust + "/ns/",
-	}
+	cao := &CA{TrustDomain: trust, Config: &CAConfig{TrustDomain: trust}}
+	cao.NewRoot()
+	return cao
+}
+
+func (ca *CA) NewRoot() {
+	cal := generateKey("")
+	caCert, caCertPEM := rootCert(ca.TrustDomain, "", "rootCA", ca, ca, nil)
+	ca.Private = cal
+	ca.CACert = caCert
+	ca.CACertPEM = caCertPEM
+	ca.prefix = "spiffe://" + ca.TrustDomain + "/ns/"
 }
 
 func CAFromEnv(dir string) *CA {
@@ -65,56 +105,79 @@ func CAFromEnv(dir string) *CA {
 	if trust == "" {
 		trust = "cluster.local"
 	}
-	ca := &CA{TrustDomain: trust, prefix: "spiffe://" + trust + "/ns/"}
+
+	ca := NewCA(&CAConfig{TrustDomain: trust, RootLocation: dir})
+
 	ca.load(dir)
-	if ca.Private != nil {
-		return ca
-	}
 
-	cak, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, caCertPEM := rootCert(trust, "rootCA", cak, cak)
-	ca.Private = cak
-	ca.CACertPEM = caCertPEM
-	ca.CACert = caCert
-
-	ca.Save(dir)
 	return ca
 }
 
-// In istio -istio-ca-secret in istio-system
-const keyFile = "ca-key.pem"
-const chainFile = "ca-cert.pem"
+// CertManager - intermediary certs have tls.key, tls.crt (std k8s)
+// plus ca.crt for the root CA. All certs issued with private CAs
+// have ca.crt - a CA cert is like any other cert.
 
-func (ca *CA) load(dir string) {
+// In istio: istio-ca-secret in istio-system used to have ca-cert.pem, ca-key.pem, ca.crt
+// However new versions use tls.key, tls.crt
+const keyFile = "tls.key"
+const chainFile = "tls.crt"
+
+func (ca *CA) load(dir string) error {
 	privPEM, err := ioutil.ReadFile(filepath.Join(dir, keyFile))
 	if err != nil {
-		return
+		return err
 	}
 	certPEM, err := ioutil.ReadFile(filepath.Join(dir, chainFile))
 	if err != nil {
-		return
+		return err
+	}
+	return ca.Load(privPEM, certPEM)
+}
+
+func (ca *CA) Load(privPEM, certPEM []byte) error {
+	kp, err := tls.X509KeyPair(certPEM, privPEM)
+	if err != nil {
+		return err
 	}
 
-	kp, err := tls.X509KeyPair(certPEM, privPEM)
 	kp.Leaf, _ = x509.ParseCertificate(kp.Certificate[0])
 	ca.CACertPEM = certPEM
 	ca.CACert = kp.Leaf
+
+	ca.Private = kp.PrivateKey
+	cn := ca.CACert.Subject.Organization[0]
+	ca.TrustDomain = cn
+	ca.prefix = "spiffe://" + cn + "/ns/"
+
+	// TODO: set trust, prefix from the loaded CA.
+
+	return nil
 }
 
-func (ca *CA) NewIntermediaryCA(trust string) *CA {
-	cak, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, caCertPEM := rootCert(trust, "rootCA", cak, ca.Private)
+func (ca *CA) NewIntermediaryCA(trust, cluster string) *CA {
+	cak := generateKey("")
+
+	caCert, caCertPEM := rootCert(trust, cluster, "rootCA", cak, ca.Private, ca.CACert)
+
+	caCertPEM = append(caCertPEM, ca.CACertPEM...)
+	// TODO: add some restrictions or meta to indicate the cluster
+
 	return &CA{Private: cak, CACert: caCert, CACertPEM: caCertPEM,
 		TrustDomain: trust,
 		prefix:      "spiffe://" + trust + "/ns/",
 	}
 }
 
-func (ca *CA) NewID(ns, sa string) *MeshAuth {
-	crt := ca.NewTLSCert(ns, sa)
+// New ID creates a new MeshAuth, with a certificate signed by this CA
+//
+// The cert will include both Spiffe identiy and DNS SANs.
+func (ca *CA) NewID(ns, sa string, dns []string) *MeshAuth {
+	crt, kp, cp := ca.NewTLSCert(ns, sa, dns)
 
-	nodeID := NewMeshAuth(nil)
+	nodeID := NewMeshAuth(&MeshAuthCfg{})
 	nodeID.AddRoots(ca.CACertPEM)
+	// Will fill in trust domain, namespace, sa from the minted cert.
+	nodeID.SetCertPEM(kp, []string{string(cp)})
 	nodeID.SetTLSCertificate(crt)
 
 	return nodeID
@@ -134,17 +197,48 @@ func (ca *CA) Save(dir string) error {
 	return nil
 }
 
-func (ca *CA) NewTLSCert(ns, sa string) *tls.Certificate {
-	nodeKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	csr := CertTemplate(ca.TrustDomain, ca.prefix+ns+"/sa/"+sa)
-	cert, _, _ := newTLSCertAndKey(csr, nodeKey, ca.Private, ca.CACert)
-	return cert
+var kty = "ec266"
+
+func generateKey(kty string) crypto.PrivateKey {
+	if kty == "ed25519" {
+		_, edpk, _ := ed25519.GenerateKey(rand.Reader)
+		return edpk
+	} else if kty == "rsa" {
+		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+		return priv
+	}
+	privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	return privk
+}
+
+// NewCertificate returns a Secret including certificates and optionally a private key.
+//
+// # WIP
+//
+// If the request has a public key, it will be used for the certs.
+//
+// V3: further simplification, certificates are just a APIserver extension using Secret as interface.
+// The cert is reflected from the request authentication.
+// Clients don't have any control (expected to be config-less) - the server policy decides.
+func (ca *CA) NewCertificate(w http.ResponseWriter, r *http.Request) {
+	// Must be wrapped in an auth handler that sets the context
+	// TODO: for sign, implement K8S cert signing interface - or get public from self-signed cert.
+
+}
+
+// NewTLSCert creates a new cert from this CA.
+func (ca *CA) NewTLSCert(ns, sa string, dns []string) (*tls.Certificate, []byte, []byte) {
+	nodeKey := generateKey("")
+	csr := certTemplate(ca.TrustDomain, ca.prefix+ns+"/sa/"+sa, dns...)
+
+	return ca.newTLSCertAndKey(csr, nodeKey, ca.Private, ca.CACert)
 }
 
 func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
 	var priv crypto.PrivateKey
 
-	rsaKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	rsaKey := generateKey("")
 	priv = rsaKey
 
 	csr := GenCSRTemplate(a.TrustDomain, san)
@@ -206,7 +300,7 @@ func GenCSRTemplate(trustDomain, san string) *x509.CertificateRequest {
 	return template
 }
 
-func CertTemplate(org string, sans ...string) *x509.Certificate {
+func certTemplate(org string, urlSAN string, sans ...string) *x509.Certificate {
 	var notBefore time.Time
 	notBefore = time.Now().Add(-1 * time.Hour)
 
@@ -218,7 +312,6 @@ func CertTemplate(org string, sans ...string) *x509.Certificate {
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			CommonName:   sans[0],
 			Organization: []string{org},
 		},
 		NotBefore: notBefore,
@@ -227,9 +320,18 @@ func CertTemplate(org string, sans ...string) *x509.Certificate {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              sans,
 		//IPAddresses:           []net.IP{auth.VIP6},
 	}
+	if urlSAN != "" {
+		u, err := url.Parse(urlSAN)
+		if err == nil {
+			template.URIs = []*url.URL{u}
+		}
+	}
+	if len(sans) > 0 {
+		template.Subject.CommonName = sans[0]
+	}
+
 	for _, k := range sans {
 		if strings.Contains(k, "://") {
 			u, _ := url.Parse(k)
@@ -248,7 +350,7 @@ func CertTemplate(org string, sans ...string) *x509.Certificate {
 	return &template
 }
 
-func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x509.Certificate, []byte) {
+func rootCert(org, ou, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*x509.Certificate, []byte) {
 	pub := PublicKey(priv)
 	var notBefore time.Time
 	notBefore = time.Now().Add(-1 * time.Hour)
@@ -270,10 +372,18 @@ func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x5
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, ca)
+	if ou != "" {
+		template.Subject.OrganizationalUnit = []string{ou}
+	}
+	if parent == nil {
+		parent = &template
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, parent, pub, ca)
 	if err != nil {
 		panic(err)
 	}
+
 	rootCA, err := x509.ParseCertificates(certDER)
 	if err != nil {
 		panic(err)
@@ -283,13 +393,22 @@ func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x5
 	return rootCA[0], certPEM
 }
 
-func newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*tls.Certificate, []byte, []byte) {
+func (c *CA) newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*tls.Certificate, []byte, []byte) {
 	pub := PublicKey(priv)
 	certDER, err := SignCertDER(template, pub, ca, parent)
 	if err != nil {
 		return nil, nil, nil
 	}
+
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypeCertificate, Bytes: certDER})
+
+	if c.IntermediatesPEM != nil {
+		certPEM = append(certPEM, c.IntermediatesPEM...)
+	}
+
+	// Add intermediate CA, if any and the root - for istio compat and to allow
+	// checking the chain using root SHA
+	certPEM = append(certPEM, c.CACertPEM...)
 
 	ecb, _ := x509.MarshalPKCS8PrivateKey(priv)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypePKCS8PrivateKey, Bytes: ecb})
