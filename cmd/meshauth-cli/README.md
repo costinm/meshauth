@@ -1,4 +1,4 @@
-Simple tool to get tokens from K8S and GKE.
+WIP: Simple tool to get tokens from K8S and GKE, debug
 
 By default it returns a JWT issued by K8S with audience "istio-ca", suitable to use with Istiod for debug.
 

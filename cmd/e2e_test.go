@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"gcp"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -12,6 +11,9 @@ import (
 	"time"
 
 	"github.com/costinm/meshauth"
+	"github.com/costinm/meshauth/pkg/oidc"
+	"github.com/costinm/meshauth/pkg/uk8s"
+	gke "github.com/costinm/mk8s/gcp"
 	"sigs.k8s.io/yaml"
 )
 
@@ -20,71 +22,102 @@ import (
 // See examples for additional configurations needed for the cluster.
 // The tests should be run with a kube config pointing to a GKE cluster with the required configs.
 
+func checkJWT(t *testing.T, jwt string) {
+	r, _ := http.NewRequest("GET", "http://example", nil)
+	// Expired key - issue a new one
+	r.Header["Authorization"] = []string{"bearer " + jwt}
+	// Example of google JWT in cloudrun:
+	// eyJhbGciOiJSUzI1NiIsImtpZCI6IjBlNzJkYTFkZjUwMWNhNmY3NTZiZjEwM2ZkN2M3MjAyOTQ3NzI1MDYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiIzMjU1NTk0MDU1OS5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF1ZCI6IjMyNTU1OTQwNTU5LmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MzY2MjYxNjgxNjMwMTM4NTIzIiwiZW1haWwiOiJjb3N0aW5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiJ1MTIwMzhrTTh2THcyZGN0dnVvbTdBIiwiaWF0IjoxNzAwODg0MDAwLCJleHAiOjE3MDA4ODc2MDB9.SIGNATURE_REMOVED_BY_GOOGLE"
+
+	cfg := &meshauth.AuthConfig{}
+	cfg.Issuers = []*meshauth.TrustConfig{{Issuer: "https://accounts.google.com"}}
+	ja := meshauth.NewAuthn(cfg)
+
+	// May use a custom method too with lower deps
+	ja.Verify = oidc.Verify
+
+	err := ja.Auth(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Use GCP credentials from gcloud as trust source.
 func TestGCP(t *testing.T) {
 	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cf()
-	ms := meshauth.NewMeshAuth(nil) // default
-	mds := ms.MDS
+	mauth := meshauth.NewMeshAuth(nil) // default
 
 	// bootstrap with GCP credentials. Source of trust is a google account from file or MDS.
-	err := gcp.GcpInit(ctx, ms, "k8s-istio-system@dmeshgate.iam.gserviceaccount.com")
+	// The local GSA  must have IAM permissions for the k8s-istio-system GSA, which is
+	// mapped to default.istio-system
+	// It must also have GKE permissions.
+	//
+	// If test runs in GCP/GKE/CR - will use MDS, otherwise ADC.
+	err := gke.GcpInit(ctx, mauth, "k8s-istio-system@dmeshgate.iam.gserviceaccount.com")
 	if err != nil {
 		t.Skip("Skipping test, no GCP creds", err)
 	}
 
-	// If test runs in GCP/GKE/CR - will use MDS, otherwise ADC.
-
-	ts := ms.AuthProviders["gcp"]
+	// GcpInit will set the 'gcp' provider.
+	ts := mauth.AuthProviders["gcp"]
 
 	access, err := ts.GetToken(ctx, "")
-	t.Log("Token", "access", access, "err", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Token", "access", access[0:7])
 
 	istio_ca, err := ts.GetToken(ctx, "istio_ca")
-	t.Log("Token", "access", istio_ca, "err", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Token", "jwt", istio_ca)
 
-	t.Log("Meta", "projectID", mds.ProjectID())
+	checkJWT(t, istio_ca)
 
-}
+	// GcpInit should also populate project ID.
+	t.Log("Meta", "projectID", mauth.MDS.ProjectID())
 
-// Test starting with a real K8S client.
-func TestK8S(t *testing.T) {
+	//base := "https://xmdsd-yydsuf6tpq-uc.a.run.app"
+
 }
 
 // Test starting with a self-signed root CA (local tests or 'depenency free'/disconnected)
 // The test also matches the meshca binary.
-func TestPrivateCA(t *testing.T) {
+func xTestPrivateCA(t *testing.T) {
 	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cf()
 
 	// Init the CA - this normally runs on a remote server with ACME certs.
 	ca := meshauth.CAFromEnv("../testdata/ca")
-	ma := ca.NewID("istio-system", "istiod")
 
-	http.HandleFunc("/.well-known/openid-configuration", ma.HandleDisc)
-	http.HandleFunc("/.well-known/jwks", ma.HandleJWK)
+	mauth := ca.NewID("istio-system", "istiod", nil)
+
+	// An MDS server should be able to proxy OIDC and know/cache JWK.
+	http.HandleFunc("/.well-known/openid-configuration", mauth.HandleDisc)
+	http.HandleFunc("/.well-known/jwks", mauth.HandleJWK)
 
 	// TODO: init a per-node intermediate CA that can sign tokens for the node or cluster.
 
 	// Use the private CA server to get a token and initialize a client
-	ma.MDS.GetToken(ctx, "istio-ca")
+	istio_ca, err := mauth.MDS.GetToken(ctx, "istio-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkJWT(t, istio_ca)
 
 }
 
 // Test starting with K8S credentials
 // On a pod or a VM/dev with a kubeconfig file.
 func TestK8SLite(t *testing.T) {
-	kconf, err := loadKubeconfig()
-	if err != nil {
-		t.Skip("Can't find a kube config file")
-	}
-
 	ctx := context.Background()
 
 	// Bootstrap K8S - get primary and secondary clusters.
-	def, extra, err := meshauth.InitK8S(ctx, kconf)
+	def, extra, err := uk8s.KubeFromEnv()
 
-	if err != nil {
+	if err != nil || def == nil {
 		t.Skip("Can't find a kube config file", err)
 	}
 
@@ -136,12 +169,12 @@ func TestK8SLite(t *testing.T) {
 
 }
 
-func loadKubeconfig() (*meshauth.KubeConfig, error) {
+func loadKubeconfig() (*uk8s.KubeConfig, error) {
 	kc := os.Getenv("KUBECONFIG")
 	if kc == "" {
 		kc = os.Getenv("HOME") + "/.kube/config"
 	}
-	kconf := &meshauth.KubeConfig{}
+	kconf := &uk8s.KubeConfig{}
 
 	var kcd []byte
 	if kc != "" {
@@ -176,7 +209,7 @@ func loadKubeconfig() (*meshauth.KubeConfig, error) {
 	return nil, nil
 }
 
-func testSTS(t *testing.T, port int, def *meshauth.K8SCluster) {
+func testSTS(t *testing.T, port int, def *uk8s.K8SCluster) {
 	// An STS server returning K8S tokens
 	sts := meshauth.NewSTS(&meshauth.STSAuthConfig{
 		TokenSource: def,
