@@ -13,12 +13,10 @@ import (
 	"log/slog"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/meshauth/cmd"
 	"github.com/costinm/meshauth/pkg/mdb"
-	"github.com/costinm/meshauth/pkg/oidc"
 	gke "github.com/costinm/mk8s/gcp"
 	k8sip "github.com/costinm/mk8s/ip"
-	"github.com/costinm/ssh-mesh/sshd"
+	sshd "github.com/costinm/ssh-mesh"
 	"github.com/costinm/utel"
 	"github.com/costinm/utel/otelbootstrap"
 	"go.opentelemetry.io/otel"
@@ -65,7 +63,7 @@ func main() {
 	traceStart := otel.Tracer("xmds-start")
 	ctx, spanStart := traceStart.Start(ctx, "sync")
 
-	maCfg := &cmd.Config{}
+	maCfg := &Config{}
 	t0 := time.Now()
 
 	// Lookup config file, init basic main file.
@@ -131,7 +129,7 @@ func main() {
 	if maCfg.BasePort == 0 {
 		maCfg.BasePort = 15200
 	}
-	ma, err := cmd.SetupAgent(ctx, maCfg)
+	ma, err := SetupAgent(ctx, maCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -155,10 +153,10 @@ func main() {
 	varzK8SStartup.Add(ctx, int64(time.Since(t0)))
 
 	auth := meshauth.NewAuthn(maCfg.AuthConfig)
-	auth.Verify = oidc.Verify
+	//auth.Verify = oidc.Verify
 
 	// Setup the wrapper
-	cmd.Listen(maCfg, func(handler http.Handler, string2 string) http.Handler {
+	Listen(maCfg, func(handler http.Handler, string2 string) http.Handler {
 		return ot.HttpHandler(&meshauth.AuthHandlerWrapper{
 			Handler: handler,
 			Logger:  slog.Default(),
@@ -194,7 +192,7 @@ func main() {
 //
 // If no key found - continue without cert signing.
 // TODO: add an option to fail if no cert found
-func SetupCA(ctx context.Context, cfg *cmd.Config, k *k8sc.K8S) {
+func SetupCA(ctx context.Context, cfg *Config, k *k8sc.K8S) {
 	mux := cfg.MainMux
 
 	if cfg.CA == nil || cfg.CA.RootLocation == "" {
@@ -256,7 +254,7 @@ func SetupCA(ctx context.Context, cfg *cmd.Config, k *k8sc.K8S) {
 		mux.HandleFunc("/apis/certs.mesh.io/v1/namespaces/", ca.NewCertificate)
 		// Public
 		mux.HandleFunc("/.well-known/openid-configuration", ma.HandleDisc)
-		mux.HandleFunc("/.well-known/jwks", ma.HandleJWK)
+		mux.HandleFunc("/.well-known/jwks", ca.HandleJWK)
 	}
 
 	// - use standard ssh config files - can be mounted from a Secret or local files

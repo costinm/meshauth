@@ -1,9 +1,9 @@
-package cmd
+package main
 
 import (
 	"context"
+	"github.com/ghodss/yaml"
 	"io/ioutil"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -16,33 +16,26 @@ import (
 //   - a kubeconfig with the default SetupAgent to a KSA with TokenRequest permission
 //     for default@NAMESPACE
 //   - permissions for the given token
-func TestGetToken(t *testing.T) {
+func TestAgent(t *testing.T) {
 	ctx := context.Background()
-	proj := os.Getenv("PROJECT_ID")
-	if proj == "" {
-		t.Skip("Missing PROJECT_ID")
-	}
-	ns := os.Getenv("NAMESPACE")
-	if ns == "" {
-		ns = "default"
-	}
 
-	ma, err := SetupAgent(ctx, &Config{
-		MeshAuthCfg: meshauth.MeshAuthCfg{
-			TrustDomain: "",
-			ProjectID:   proj,
-			Namespace:   ns,
-			Name:        "default",
-			// email field in returned token, sub is an ID
-			GSA: "k8s-" + ns + "@" + proj + ".iam.gserviceaccount.com",
-		}})
+	cfile, err := os.ReadFile("../../testdata/alice/testenv.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	err = yaml.Unmarshal(cfile, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Direct access to the MDSAgent providers
-	tp := ma.AuthProviders["gcp"]
+	ma, err := SetupAgent(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	// Verify we can get access and ID tokens for GCP
+	tp := ma.AuthProviders["gcp"]
 	// email: k8s-NAMESPACE@PROJECT.iam.gserviceaccount.com, sub is an ID.
 	tok, err := tp.GetToken(ctx, "https://example.com")
 	if err != nil {
@@ -57,9 +50,27 @@ func TestGetToken(t *testing.T) {
 	}
 	t.Log(tok[0:16], err)
 
+	// Federated token
+	ftp := ma.AuthProviders["gcp_fed"]
+	tok, err = ftp.GetToken(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(tok[0:16], err)
+
+	// K8S tokens
+	ktp := ma.AuthProviders["k8s"]
+	// email: k8s-NAMESPACE@PROJECT.iam.gserviceaccount.com, sub is an ID.
+	tok, err = ktp.GetToken(ctx, "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(meshauth.TokenPayload(tok), err)
+
 	// Test the HTTP interface
 	// Start the metadata server
 	//l, err := net.Listen("tcp", ":17014") // :0
+	//l, err := net.Listen("tcp", ":0") // :0
 	//if err != nil {
 	//	t.Fatal(err)
 	//}
@@ -70,8 +81,9 @@ func TestGetToken(t *testing.T) {
 	// Call the http interface
 	req := httptest.NewRequest("GET", base+"/computeMetadata/v1/instance/service-accounts/default/identity?audience=ssh:", nil)
 	req.Header.Add("Metadata-Flavor", "Google")
+
 	res := httptest.NewRecorder()
-	http.DefaultServeMux.ServeHTTP(res, req)
+	cfg.MainMux.ServeHTTP(res, req)
 
 	data, err := ioutil.ReadAll(res.Result().Body)
 	if err != nil {

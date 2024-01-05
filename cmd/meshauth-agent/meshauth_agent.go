@@ -5,7 +5,6 @@ import (
 	"log"
 	"log/slog"
 
-	"github.com/costinm/meshauth/cmd"
 	"github.com/costinm/meshauth/util"
 	"github.com/costinm/utel"
 	uotel "github.com/costinm/utel/otel"
@@ -30,7 +29,6 @@ import (
 // For envoy and c++ grpc - requires /etc/hosts or resolver for metadata.google.internal.
 //
 // Alternative: use ssh-mesh or equivalent to forward to real MDS.
-//
 func main() {
 
 	ctx := context.Background()
@@ -39,7 +37,7 @@ func main() {
 	uotel.InitTracing()
 	uotel.InitExpvarMetrics()
 
-	maCfg := &cmd.Config{}
+	maCfg := &Config{}
 
 	// name ends up as "InstrumentataionLibrary.start
 	traceStart := otel.Tracer("xmds-start")
@@ -49,14 +47,14 @@ func main() {
 	// Lookup config file, init basic main file.
 	util.MainStart("mds", maCfg)
 
-	_, err := cmd.SetupAgent(ctx, maCfg)
+	_, err := SetupAgent(ctx, maCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	spanStart.End()
 
-	cmd.Listen(maCfg, nil)
+	Listen(maCfg, nil)
 
 	util.MainEnd()
 }

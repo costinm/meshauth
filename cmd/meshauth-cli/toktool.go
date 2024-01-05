@@ -15,8 +15,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	k8sc "github.com/costinm/mk8s/k8s"
+
 	"github.com/costinm/meshauth"
-	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -32,12 +33,6 @@ var (
 
 	decode = flag.String("d", "", "Decode token")
 )
-
-func init() {
-	meshauth.YAMLUnmarshal = func(bytes []byte, i interface{}) error {
-		return yaml.Unmarshal(bytes, i)
-	}
-}
 
 // Decode a JWT.
 // If crt is specified - verify it using that cert
@@ -111,15 +106,25 @@ func main() {
 	}
 
 	ctx := context.Background()
-	def, _, err := meshauth.KubeFromEnv()
+	k := k8sc.NewK8S(&k8sc.K8SConfig{
+		Namespace: *namespace,
+		KSA:       *ksa,
+	})
+	err := k.InitK8SClient(ctx)
+
+	def := k.Default
 	if err != nil {
 		log.Fatal("Can't load kube config file")
 	}
+	projectID, _, _ := def.GcpInfo()
 
 	var tokenProvider meshauth.TokenSource
 
 	if *fed {
-		tokenProvider, err = def.GCPFederatedSource(ctx)
+		tokenProvider = meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
+			AudienceSource: projectID + ".svc.id.goog",
+			TokenSource:    def,
+		})
 	} else if *gcpSA == "" {
 		tokenProvider = def // .NewK8STokenSource(*aud)
 	} else {
@@ -127,7 +132,11 @@ func main() {
 		if *gcpSA == "default" {
 			gsa = ""
 		}
-		tokenProvider, err = meshauth.GCPAccessTokenSource(def, gsa)
+		tokenProvider = meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
+			AudienceSource: projectID + ".svc.id.goog",
+			TokenSource:    def,
+			GSA:            gsa,
+		})
 	}
 	if err != nil {
 		log.Fatal("Failed to get token", err)

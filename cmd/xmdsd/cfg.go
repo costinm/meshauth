@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 
 	"github.com/costinm/meshauth"
 	"github.com/costinm/meshauth/pkg/authz"
-	"github.com/costinm/meshauth/pkg/uk8s"
 	k8sc "github.com/costinm/mk8s/k8s"
 )
 
@@ -130,19 +129,18 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	ma.AuthProviders["k8s"] = k
 
 	fedS := meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
-		TrustDomain: ma.ProjectID + ".svc.id.goog",
-		TokenSource: k,
+		AudienceSource: ma.ProjectID + ".svc.id.goog",
+		TokenSource:    k,
 	})
-	if ma.GSA == "" {
-		// Federated access tokens (for ${PROJECT_ID}.svc.id.goog[ns/ksa]
-		// K8S JWT access tokens otherwise.
-		ma.AuthProviders["gcp_fed"] = fedS
-	} else {
+	// Federated access tokens (for ${PROJECT_ID}.svc.id.goog[ns/ksa]
+	// K8S JWT access tokens otherwise.
+	ma.AuthProviders["gcp_fed"] = fedS
 
-		audTokenS := uk8s.NewGCPTokenSource(&uk8s.GCPAuthConfig{
-			TokenSource: fedS,
-			GSA:         ma.GSA,
-			TrustDomain: ma.ProjectID + ".svc.id.goog",
+	if ma.GSA != "" {
+		audTokenS := meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
+			AudienceSource: ma.ProjectID + ".svc.id.goog",
+			TokenSource:    k,
+			GSA:            ma.GSA,
 		})
 
 		ma.AuthProviders["gcp"] = audTokenS
@@ -150,10 +148,6 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 
 	// Emulated MDS server
 	mux.HandleFunc("/computeMetadata/v1/", ma.MDS.ServeHTTP)
-
-	// WIP, TODO - support envoy sts ( and sts in general )
-	sts := meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{})
-	mux.Handle("/sts/", sts)
 
 	// TODO: handler to return the root cert, root SHA, public - and workload sha (DANE)
 
