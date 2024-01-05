@@ -57,6 +57,8 @@ type MDS struct {
 	Meta sync.Map
 }
 
+// Metadata is the root of the GCP metadata.
+// Using it as a base, to avoid conversions and mappings.
 type Metadata struct {
 	Instance Instance `json:"instance"`
 }
@@ -70,10 +72,6 @@ type Instance struct {
 	InstanceID int    `json:"id"`
 	Zone       string `json:"zone"`
 	Name       string `json:"name"`
-}
-
-func NewMDS() *MDS {
-	return &MDS{}
 }
 
 // Determine the workload name, using environment variables or hostname.
@@ -309,14 +307,4 @@ func (m *MDS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		fmt.Fprintf(w, "%s", "us-central1")
 	}
-}
-
-func accessToken(s string) bool {
-	if len(s) == 0 {
-		return true
-	}
-	if strings.Contains(s, ".googleapis.com") {
-		return true
-	}
-	return false
 }

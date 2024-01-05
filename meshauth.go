@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/costinm/meshauth/util"
 )
@@ -149,103 +151,6 @@ type AuthzRule struct {
 	AllowedNamespaces []string
 }
 
-// Dest represents a destination and associated security info.
-//
-// In Istio this is represented as DestinationRule, Envoy - Cluster, K8S Service (the backend side).
-//
-// This is primarily concerned with the security aspects (auth, transport),
-// and include 'trusted' attributes from K8S configs or JWT/cert.
-//
-// K8S clusters can be represented as a Dest - rest.Config Host is Addr, CACertPEM the CAFile
-type Dest struct {
-
-	// For HTTP, Addr is the URL, including any required path prefix, for the destination.
-	// For TCP, Addr is the TCP address - VIP:port or DNS:port format. tcp:// is assumed.
-	// For K8S service it should be in the form serviceName.namespace.svc:svcPort
-	// The cluster suffix is assumed to be 'cluster.local' or the custom k8s suffix.
-	//
-	// This can also be an 'original dst' address for individual endpoints.
-	//
-	// Individual IPs (real or relay like waypoints or egress GW, etc) will be in
-	// the info.addrs field.
-	// Equivalent to cluster.server in kubeconfig.
-	Addr string `json:"addr,omitempty"`
-
-	// Sources of trust for validating the peer destination.
-	// Typically, a certificate - if not set, SYSTEM certificates will be used for non-mesh destinations
-	// and the MESH certificates for destinations using one of the mesh domains.
-	TrustConfig *TrustConfig `json:"trust,omitempty"`
-
-	// Expected SANs - if not set, the DNS host in the address is used.
-	// For mesh FQDNs, the namespace will be checked ( second part of the FQDN )
-	DNSSANs []string `json:"dns_san,omitempty"`
-	IPSANs  []string `json:"ip_san,omitempty"`
-	URLSANs []string `json:"url_san,omitempty"`
-
-	// SNI to use when making the request. Defaults to hostname in Addr
-	SNI string `json:"sni,omitempty"`
-
-	ALPN []string `json:"alpn,omitempty"`
-
-	// VIP is the set of IPs assigned to this destination.
-	// May be prefixed by a network, if it is not the default network.
-	// Used as information and for capture.
-	VIP []string
-
-	// If empty, the cluster is using system certs or SPIFFE CAs - as configured in
-	// MeshAuth.
-	//
-	// Otherwise, it's the configured root certs list, in PEM format.
-	// May include multiple concatenated roots.
-	//
-	// TODO: allow root SHA only.
-	// Deprecated: use TrustConfig
-	CACertPEM []byte
-
-	// If set, the CA will be loaded from this file. It may be refreshed.
-	// Deprecated: use TrustConfig
-	CAFile string
-
-	// If set, this is required to verify the certs of dest if https is used
-	// If not set, system certs are used
-	roots *x509.CertPool `json:-`
-
-	// Credentials to use to authenticate to this destination.
-
-	// If set, the token source will be used.
-	// Using gRPC interface which returns the full auth string, not only the token
-	//
-	TokenProvider PerRPCCredentials `json:-`
-
-	// Static token to use. May be a long lived K8S service account secret or other long-lived creds.
-	// Alternative: static token source
-	Token string
-
-	// If set, a token source with this name is used. The provider must be set in MeshEnv.AuthProviders
-	// If not found, no tokens will be added. If found, errors getting tokens will result
-	// in errors connecting.
-	// In K8S - it will be the well-known token file.
-	TokenSource string
-
-	// WebpushPublicKey is the client's public key. From the getKey("p256dh") or keys.p256dh field.
-	// This is used for Dest that accepts messages encrypted using webpush spec, and may
-	// be used for validating self-signed destinations - this is expected to be the public
-	// key of the destination.
-	// Primary public key of the node.
-	// EC256: 65 bytes, uncompressed format
-	// RSA: DER
-	// ED25519: 32B
-	// Used for sending encryted webpush message
-	// If not known, will be populated after the connection.
-	WebpushPublicKey []byte `json:"pub,omitempty"`
-
-	// Webpush Auth is a secret shared with the peer, used in sending webpush
-	// messages.
-	WebpushAuth []byte `json:"auth,omitempty"`
-	// TLS-related settings
-
-}
-
 type AuthConfig struct {
 	// Trusted issuers for auth.
 	//
@@ -318,10 +223,10 @@ type TrustConfig struct {
 	// JSON Web Key Set of public keys to validate signature of the JWT.
 	// See https://auth0.com/docs/jwks.
 	//
-	// Note: Only one of jwks_uri and jwks should be used. jwks_uri will be ignored if it does.
+	// Note: In Istio, only one of jwks_uri and jwks should be used. jwks_uri
+	// will be ignored if Jwks is present - but it doesn't seem right.
 	//
-	// Strongly discouraged: keys should be rotated frequently.
-	// TODO: mutating webhook to pupulate this field, controller JOB to rotate
+	// TODO: mutating webhook to populate this field, controller JOB to rotate
 	Jwks string `protobuf:"bytes,10,opt,name=jwks,proto3" json:"jwks,omitempty"`
 
 	// List of header locations from which JWT is expected. For example, below is the location spec
@@ -366,6 +271,13 @@ type TrustConfig struct {
 
 	// Not stored - the actual keys or verifiers for this issuer.
 	Key interface{} `json:-"`
+
+	// KeysById is populated from the Jwks config
+	KeysByKid map[string]interface{} `json:-`
+
+	m         sync.Mutex `json:-`
+	lastFetch time.Time  `json:-`
+	exp       time.Time  `json:-`
 }
 
 // MeshAuth represents a workload identity and associated info required for minimal
@@ -425,6 +337,9 @@ type MeshAuth struct {
 	ClientSessionCache tls.ClientSessionCache
 
 	Stop chan struct{}
+
+	// Location is the location of the node - derived from MDS or config.
+	Location string
 }
 
 // Interface for very simple storage abstraction.
@@ -577,9 +492,10 @@ func (ma *MeshAuth) inCluster() *Dest {
 
 	ca, err := os.ReadFile(rootCAFile)
 
+	fts := &FileTokenSource{TokenFile: tokenFile}
 	c := &Dest{
 		Addr:          "https://" + net.JoinHostPort(host, port),
-		TokenProvider: &FileTokenSource{TokenFile: tokenFile},
+		TokenProvider: fts,
 	}
 	c.AddCACertPEM(ca)
 
@@ -615,4 +531,130 @@ func (auth *MeshAuth) RoundTripper(d *Dest) http.RoundTripper {
 	}
 	// Default transport
 	return auth.Transport(d)
+}
+
+// ------------ Helpers around TokenSource
+
+type PerRPCCredentialsFromTokenSource struct {
+	TokenSource
+}
+
+func (s *PerRPCCredentialsFromTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	t, err := s.GetToken(ctx, uri[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]string{
+		"authorization": "Bearer " + t,
+	}, nil
+}
+
+func (s *PerRPCCredentialsFromTokenSource) RequireTransportSecurity() bool { return false }
+
+// TODO: file based access, using /var/run/secrets/ file pattern and mounts.
+// TODO: Exec access, using /usr/lib/google-cloud-sdk/bin/gke-gcloud-auth-plugin (11M) for example
+//  name: gke_costin-asm1_us-central1-c_td1
+//  user:
+//    exec:
+//      apiVersion: client.authentication.k8s.io/v1beta1
+//      command: gke-gcloud-auth-plugin
+//      installHint: Install gke-gcloud-auth-plugin for use with kubectl by following
+//        https://cloud.google.com/blog/products/containers-kubernetes/kubectl-auth-changes-in-gke
+//      provideClusterInfo: true
+
+// /usr/lib/google-cloud-sdk/bin/gke-gcloud-auth-plugin
+// {
+//    "kind": "ExecCredential",
+//    "apiVersion": "client.authentication.k8s.io/v1beta1",
+//    "spec": {
+//        "interactive": false
+//    },
+//    "status": {
+//        "expirationTimestamp": "2022-07-01T15:55:01Z",
+//        "token": ".." // ya29
+//    }
+//}
+
+// File or static token source
+type FileTokenSource struct {
+	TokenFile string
+}
+
+func (s *FileTokenSource) GetToken(context.Context, string) (string, error) {
+	if s.TokenFile != "" {
+		tfb, err := os.ReadFile(s.TokenFile)
+		if err != nil {
+			return "", err
+		}
+		return string(tfb), nil
+	}
+	return "", nil
+}
+
+type StaticTokenSource struct {
+	Token string
+}
+
+func (s *StaticTokenSource) GetToken(context.Context, string) (string, error) {
+	return s.Token, nil
+}
+
+type AudienceOverrideTokenSource struct {
+	TokenSource TokenSource
+	Audience    string
+}
+
+func (s *AudienceOverrideTokenSource) GetToken(ctx context.Context, _ string) (string, error) {
+	return s.TokenSource.GetToken(ctx, s.Audience)
+}
+
+const Default = "default"
+
+// InitK8SInCluster will check if running in cluster, and init based on the K8S
+// environment files.
+func InitK8SInCluster(ma *MeshAuth) (*Dest, error) {
+	const (
+		tokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		rootCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	)
+	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
+	if len(host) == 0 || len(port) == 0 {
+		return nil, nil
+	}
+
+	token, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return nil, err
+	}
+
+	ca, err := os.ReadFile(rootCAFile)
+
+	c := &Dest{
+		Addr:          "https://" + net.JoinHostPort(host, port),
+		TokenProvider: &FileTokenSource{TokenFile: tokenFile},
+	}
+	c.AddCACertPEM(ca)
+
+	namespace, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err == nil {
+		ma.Namespace = string(namespace)
+	}
+
+	jwt := DecodeJWT(string(token))
+	if ma.Namespace == "" {
+		ma.Namespace = jwt.K8S.Namespace
+	}
+	if ma.Name == "" {
+		ma.Name = jwt.Name
+	}
+
+	ma.Dst["K8S"] = c
+
+	ma.AuthProviders["K8S"] = &K8STokenSource{
+		Dest:           c,
+		Namespace:      ma.Namespace,
+		ServiceAccount: ma.Name}
+
+	return c, nil
 }

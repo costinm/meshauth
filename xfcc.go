@@ -2,8 +2,10 @@ package meshauth
 
 import "strings"
 
-// Authenticate using Istio mTLS, for gRPC and HTTP
-// TODO: move to separate module, deps free
+// WIP: Authenticate using Istio mTLS, for gRPC and HTTP
+// Not clear it has a future - using JWTs and mapping claims from cert to headers seem more
+// consistent and far simpler for users.
+// Almost all client certificates have very few useful 'claims'.
 
 // Alternative: https://pkg.go.dev/github.com/alecholmes/xfccparser@v0.1.0
 

@@ -21,6 +21,7 @@ import (
 )
 
 // Webpush encryption using certs.
+
 const (
 	maxPayloadLength = 4078
 )

@@ -42,8 +42,10 @@ func (h *AuthHandlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http
 	defer func() {
 		// TODO: add it to an event buffer
 		if h.Logger != nil {
-			h.Logger.Log(request.Context(), slog.LevelInfo, "remoteID", RemoteID,
-				"SAN", SAN, "request", request.URL, "time", time.Since(actx.Start))
+			h.Logger.InfoContext(request.Context(), "REQUEST",
+				"remoteID", RemoteID,
+				"SAN", SAN,
+				"request", request.URL, "time", time.Since(actx.Start))
 		}
 		if r := recover(); r != nil {
 			// TODO: this should go to utel tracing (via slog interface)

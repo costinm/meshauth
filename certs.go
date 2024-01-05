@@ -1096,9 +1096,15 @@ func (a *MeshAuth) HandleDisc(w http.ResponseWriter, r *http.Request) {
 	// Issuer must match the hostname used to connect.
 	//
 	w.Header().Set("content-type", "application/json")
+
+	base := "https://" + r.Host
+	if r.TLS == nil {
+		base = "http://" + r.Host
+	}
+
 	fmt.Fprintf(w, `{
-  "issuer": "https://%s",
-  "jwks_uri": "https://%s/jwks",
+  "issuer": "%s",
+  "jwks_uri": "%s/.well-known/jwks",
   "response_types_supported": [
     "id_token"
   ],
@@ -1108,35 +1114,10 @@ func (a *MeshAuth) HandleDisc(w http.ResponseWriter, r *http.Request) {
   "id_token_signing_alg_values_supported": [
     "ES256"
   ]
-}`, r.Host, r.Host)
+}`, base, base)
 
 	// ,"EdDSA"
 	// TODO: switch to EdDSA
-}
-
-// OIDC JWK
-func (a *MeshAuth) HandleJWK(w http.ResponseWriter, r *http.Request) {
-	pk := a.Cert.PrivateKey.(*ecdsa.PrivateKey)
-	byteLen := (pk.Params().BitSize + 7) / 8
-	ret := make([]byte, byteLen)
-	pk.X.FillBytes(ret[0:byteLen])
-	x64 := base64.RawURLEncoding.EncodeToString(ret[0:byteLen])
-	pk.Y.FillBytes(ret[0:byteLen])
-	y64 := base64.RawURLEncoding.EncodeToString(ret[0:byteLen])
-	fmt.Fprintf(w, `{
-  "keys": [
-    {
-		 "kty" : "EC",
-		 "crv" : "P-256",
-		 "x"   : "%s",
-		 "y"   : "%s",
-    }
-  ]
-	}`, x64, y64)
-
-	//		"crv": "Ed25519",
-	//		"kty": "OKP",
-	//		"x"   : "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
 }
 
 // Sign - requires ECDSA primary key

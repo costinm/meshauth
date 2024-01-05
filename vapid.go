@@ -15,23 +15,22 @@
 package meshauth
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"net/url"
 	"strings"
 	"time"
 )
 
-// RFC9292 - VAPID
+// RFC9292 - VAPID is an auth scheme based on public keys (EC256 only).
 
 var (
 	// encoded {"typ":"JWT","alg":"ES256"}
@@ -41,6 +40,13 @@ var (
 	vapidPrefixED = []byte("eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.")
 	dot           = []byte(".")
 )
+
+func (auth *MeshAuth) GetToken(ctx context.Context, aud string) (string, error) {
+	jwt := &JWT{
+		Aud: []string{aud},
+	}
+	return jwt.Sign(auth.Cert.PrivateKey), nil
+}
 
 // VAPIDToken creates a token with the specified endpoint, using configured Sub id
 // and a default expiration (1h). The MeshAuth identity must be based on EC256.
@@ -128,38 +134,7 @@ func jwtParseAndCheckSig(tok string, pk crypto.PublicKey) (*JWT, error) {
 		return nil, err
 	}
 
-	return JWTVerify(h, b, txt, sig, pk)
-}
-
-// JWTVerify will verify "txt" using a public key or other verifiers.
-func JWTVerify(h *JWTHead, b *JWT, txt []byte, sig []byte, pk crypto.PublicKey) (*JWT, error) {
-	hasher := crypto.SHA256.New()
-	hasher.Write(txt)
-
-	if h.Alg == "ES256" {
-		r := big.NewInt(0).SetBytes(sig[0:32])
-		s := big.NewInt(0).SetBytes(sig[32:64])
-		match := ecdsa.Verify(pk.(*ecdsa.PublicKey), hasher.Sum(nil), r, s)
-		if !match {
-			return nil, errors.New("invalid ES256 signature")
-		}
-		return b, nil
-	} else if h.Alg == "EdDSA" {
-		ok := ed25519.Verify(pk.(ed25519.PublicKey), hasher.Sum(nil), sig)
-		if !ok {
-			return nil, errors.New("invalid ED25519 signature")
-		}
-	} else if h.Alg == "RS256" {
-		rsak := pk.(*rsa.PublicKey)
-		hashed := hasher.Sum(nil)
-		err := rsa.VerifyPKCS1v15(rsak, crypto.SHA256, hashed, sig)
-		if err != nil {
-			return nil, err
-		}
-		return b, nil
-	}
-
-	return nil, errors.New("Unsupported " + h.Alg)
+	return JWTVerifySignature(h, b, txt, sig, pk)
 }
 
 // CheckVAPID verifies the signature and returns the token and public key.

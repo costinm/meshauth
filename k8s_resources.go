@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// Common K8S resources (or subsets).
+// When possible, use the K8S representation - even for configs used outside K8S.
+
 // TypeMeta describes an individual object in an API response or request
 // with strings representing the type of the object and its API schema version.
 // Structures that are versioned or persisted should inline TypeMeta.
@@ -87,7 +90,7 @@ type ObjectMeta struct {
 	// name ONLY IF the Name field has not been provided.
 	// If this field is used, the name returned to the client will be different
 	// than the name passed. This value will also be combined with a unique suffix.
-	// The provided value has the same validation rules as the Name field,
+	// The provided value has the same validation Rules as the Name field,
 	// and may be truncated by the length of the suffix required to make the value
 	// unique on the server.
 	//

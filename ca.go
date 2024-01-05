@@ -1,6 +1,7 @@
 package meshauth
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -10,8 +11,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -108,7 +112,10 @@ func CAFromEnv(dir string) *CA {
 
 	ca := NewCA(&CAConfig{TrustDomain: trust, RootLocation: dir})
 
-	ca.load(dir)
+	err := ca.load(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	return ca
 }
@@ -298,6 +305,38 @@ func GenCSRTemplate(trustDomain, san string) *x509.CertificateRequest {
 	// TODO: add the SAN, it is not required, server will fill up
 
 	return template
+}
+
+func (a *CA) GetToken(ctx context.Context, aud string) (string, error) {
+	jwt := &JWT{
+		Aud: []string{aud},
+	}
+	return jwt.Sign(a.Private), nil
+}
+
+// OIDC JWKS handler - returns the
+func (a *CA) HandleJWK(w http.ResponseWriter, r *http.Request) {
+	pk := a.Private.(*ecdsa.PrivateKey)
+	byteLen := (pk.Params().BitSize + 7) / 8
+	ret := make([]byte, byteLen)
+	pk.X.FillBytes(ret[0:byteLen])
+	x64 := base64.RawURLEncoding.EncodeToString(ret[0:byteLen])
+	pk.Y.FillBytes(ret[0:byteLen])
+	y64 := base64.RawURLEncoding.EncodeToString(ret[0:byteLen])
+	fmt.Fprintf(w, `{
+  "keys": [
+    {
+		 "kty" : "EC",
+		 "crv" : "P-256",
+		 "x"   : "%s",
+		 "y"   : "%s",
+    }
+  ]
+	}`, x64, y64)
+
+	//		"crv": "Ed25519",
+	//		"kty": "OKP",
+	//		"x"   : "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
 }
 
 func certTemplate(org string, urlSAN string, sans ...string) *x509.Certificate {

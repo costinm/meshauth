@@ -1,17 +1,170 @@
 package meshauth
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"math/big"
+	"net"
+	"net/http"
 	"testing"
 	"time"
+
+	"github.com/costinm/meshauth/pkg/stsd"
 )
+
+func TestJWKS(t *testing.T) {
+	ctx := context.Background()
+
+	// Init the CA - this normally runs on a remote server with ACME certs.
+	ca := CAFromEnv("testdata/ca")
+
+	mauth := ca.NewID("istio-system", "istiod", nil)
+
+	laddr := startServer(t, ca, mauth)
+	// TODO: start an auth server
+
+	cfg := &AuthConfig{
+		Issuers: []*TrustConfig{
+			&TrustConfig{
+				Issuer: "https://accounts.google.com",
+			},
+			&TrustConfig{
+				Issuer: "https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1",
+			},
+			//&TrustConfig{
+			//	Issuer: laddr,
+			//},
+		},
+	}
+	ja := NewAuthn(cfg)
+
+	l := &TrustConfig{
+		Issuer: "http://" + laddr,
+	}
+	err := ja.UpdateKeys(ctx, l)
+	if err != nil {
+		t.Error(err)
+	}
+
+	err = ja.FetchAllKeys(ctx, cfg.Issuers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(cfg.Issuers)
+
+	// Client tests
+	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cf()
+
+	// Will get K8S tokens to authenticate, with istio-ca audience
+	stsc := NewFederatedTokenSource(&STSAuthConfig{
+		STSEndpoint: "http://" + laddr + "/v1/token",
+		TokenSource: ca, // def.NewK8STokenSource("istio-ca"),
+	})
+
+	_, err = stsc.GetToken(ctx, "http://foo.com")
+	if err != nil {
+		t.Fatal("STSc token ", err)
+	}
+
+	mdsc := &MDS{
+		Addr: "http://" + laddr + "/computeMetadata/v1",
+	}
+
+	_, err = mdsc.GetToken(ctx, "http://foo.com")
+	if err != nil {
+		t.Fatal("getting token from MDS", err)
+	}
+
+	// Use the private CA server to get a token and initialize a client
+	istio_ca, err := mauth.MDS.GetToken(ctx, "istio-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkJWT(t, istio_ca)
+
+}
+
+// startServer will start a basic XMDS server, with deps-free packages.
+// - ca and JWT signing - using testdata
+// - local metadata server
+//
+// TODO: alternative is to run xmdsd in testdata dir.
+func startServer(t *testing.T, ca *CA, mauth *MeshAuth) string {
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 0})
+	if err != nil {
+		t.Fatal("Listen")
+	}
+	_, p, _ := net.SplitHostPort(l.Addr().String())
+	addr := fmt.Sprintf("localhost:%s", p)
+
+	authn := NewAuthn(&AuthConfig{
+		Issuers: []*TrustConfig{
+			&TrustConfig{
+				Issuer: "http://" + addr,
+			},
+		},
+	})
+	// An STS server returning tokens signed by the CA.
+	sts := &stsd.TokenExchangeD{
+		Authn: authn,
+		Generate: func(ctx context.Context, jwt *JWT, aud string) (string, error) {
+			return ca.GetToken(ctx, aud)
+		},
+	}
+
+	mds := &MDS{}
+
+	mux := &http.ServeMux{}
+
+	mux.Handle("/v1/token", sts)
+
+	mux.Handle("/computeMetadata/v1/", mds)
+	mux.HandleFunc("/.well-known/openid-configuration", mauth.HandleDisc)
+	mux.HandleFunc("/.well-known/jwks", ca.HandleJWK)
+	mux.HandleFunc("/jwks", ca.HandleJWK)
+
+	// An MDS server should be able to proxy OIDC and know/cache JWK.
+
+	// TODO: init a per-node intermediate CA that can sign tokens for the node or cluster.
+
+	go http.Serve(l, mux)
+
+	return addr
+}
+
+func checkJWT(t *testing.T, jwt string) {
+
+	r, _ := http.NewRequest("GET", "http://example", nil)
+	// Expired key - issue a new one
+	r.Header["Authorization"] = []string{"bearer " + jwt}
+
+	// Example of google JWT in cloudrun:
+	// eyJhbGciOiJSUzI1NiIsImtpZCI6IjBlNzJkYTFkZjUwMWNhNmY3NTZiZjEwM2ZkN2M3MjAyOTQ3NzI1MDYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiIzMjU1NTk0MDU1OS5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF1ZCI6IjMyNTU1OTQwNTU5LmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MzY2MjYxNjgxNjMwMTM4NTIzIiwiZW1haWwiOiJjb3N0aW5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiJ1MTIwMzhrTTh2THcyZGN0dnVvbTdBIiwiaWF0IjoxNzAwODg0MDAwLCJleHAiOjE3MDA4ODc2MDB9.SIGNATURE_REMOVED_BY_GOOGLE"
+
+	cfg := &AuthConfig{}
+
+	cfg.Issuers = []*TrustConfig{{Issuer: "https://accounts.google.com"}}
+
+	ja := NewAuthn(cfg)
+
+	// May use a custom method too with lower deps
+	//ja.Verify = oidc.Verify
+
+	err := ja.Auth(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ========== Old VAPID JWT tests =============
 
 const (
 	testpriv = "bSaKOws92sj2DdULvWSRN3O03a5vIkYW72dDJ_TIFyo"

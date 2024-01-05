@@ -51,11 +51,6 @@ type Conf struct {
 	Sources []Store
 }
 
-// YAMLUnmarshal must be set to support yaml files. This avoids a dependency on a yaml library.
-// Normally "sigs.k8s.io/yaml"
-// Required to support KUBECONFIG and to load yaml files in addition to json.
-var YAMLUnmarshal func([]byte, interface{}) error
-
 // NewConf Returns a config store.
 //
 // Implements a basic auth.Store interface
