@@ -14,6 +14,33 @@ import (
 	"time"
 )
 
+/*
+New model (2024):
+
+- Dest is a HOST:port or URL - for a specific (frontend) service. The hostname portion
+  will be resolved with DNS, EDS, meshauth to get 'endpoints'.
+
+- Hosts is a pod, VM, container with a FQDN hostname, addresses and labels. Doesn't include
+  ports - it is expected if the host is returned for a 'dest', it will listen on the right port.
+
+- hosts may be directly visible or exposed 'via' a different jump host - SSH, SNI, waypoints.
+
+- when connecting to a frontend (Dest), by default it is expected it will have a DNS cert, unless
+  the resolved endpoint's host has specific config (spiffe cert, etc).
+
+Meshauth is primarily concerned with authenticating the server and client, but it also
+includes secure discovery and bootstrap. It is NOT concerned with protocols.
+
+Difference between 'Service frontend' and 'workload endpoint' is subtle and not always visible.
+We have a FQDN:port or VIP:port. The FQDN may resolve (DNS or EDS) to multiple IPs - which
+can be load balancers/waypoints or real endpoints. A host may have multiple IPs too.
+
+From client perspective the main difference is that for Service we may get weights and localities
+and perform advanced client-side load balancing and routing.
+
+ */
+
+
 // Dest represents a destination and associated security info.
 //
 // In Istio this is represented as DestinationRule, Envoy - Cluster, K8S Service (the backend side).
@@ -22,6 +49,8 @@ import (
 // and include 'trusted' attributes from K8S configs or JWT/cert.
 //
 // K8S clusters can be represented as a Dest - rest.Config Host is Addr, CACertPEM
+//
+// Unlike K8S and Envoy, the port is not required.
 type Dest struct {
 
 	// For HTTP, Addr is the URL, including any required path prefix, for the destination.
@@ -37,15 +66,26 @@ type Dest struct {
 	// Equivalent to cluster.server in kubeconfig.
 	Addr string `json:"addr,omitempty"`
 
+	Proto string `json:"protocol,omitempty"`
+
+	//FQDN []string `json:"fqdn,omitempty"`
+
+	// VIP is the set of IPs assigned to this destination.
+	// Only set for (frontend) Services. Used when capturing traffic for this service
+	//
+	//VIP []string `json:"alpn,omitempty"`
+
+
 	// Sources of trust for validating the peer destination.
 	// Typically, a certificate - if not set, SYSTEM certificates will be used for non-mesh destinations
 	// and the MESH certificates for destinations using one of the mesh domains.
+	// If not set, the nodes' trust config is used.
 	TrustConfig *TrustConfig `json:"trust,omitempty"`
 
 	// Expected SANs - if not set, the DNS host in the address is used.
 	// For mesh FQDNs, the namespace will be checked ( second part of the FQDN )
 	DNSSANs []string `json:"dns_san,omitempty"`
-	IPSANs  []string `json:"ip_san,omitempty"`
+	//IPSANs  []string `json:"ip_san,omitempty"`
 	URLSANs []string `json:"url_san,omitempty"`
 
 	// SNI to use when making the request. Defaults to hostname in Addr
@@ -53,10 +93,8 @@ type Dest struct {
 
 	ALPN []string `json:"alpn,omitempty"`
 
-	// VIP is the set of IPs assigned to this destination.
-	// May be prefixed by a network, if it is not the default network.
-	// Used as information and for capture.
-	VIP []string
+	// Location is set if the cluster has a default location (not global).
+	Location string `json:"location,omitempty"`
 
 	// If empty, the cluster is using system certs or SPIFFE CAs - as configured in
 	// MeshAuth.
@@ -65,7 +103,22 @@ type Dest struct {
 	// May include multiple concatenated roots.
 	//
 	// TODO: allow root SHA only.
-	CACertPEM []byte
+	CACertPEM []byte `json:"ca_cert,omitempty"`
+
+	// From CDS
+
+	// timeout for new network connections to endpoints in cluster
+	ConnectTimeout           time.Duration `json:"connect_timeout,omitempty"`
+	TCPKeepAlive             time.Duration `json:"tcp_keep_alive,omitempty"`
+	TCPUserTimeout           time.Duration `json:"tcp_user_timeout,omitempty"`
+	//MaxRequestsPerConnection int
+
+	// Default values for initial window size, initial window, max frame size
+	InitialConnWindowSize int32 `json:"initial_conn_window,omitempty"`
+	InitialWindowSize     int32 `json:"initial_window,omitempty"`
+	MaxFrameSize          uint32 `json:"max_frame_size,omitempty"`
+
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// If set, this is required to verify the certs of dest if https is used
 	// If not set, system certs are used
@@ -80,7 +133,7 @@ type Dest struct {
 	// If not found, no tokens will be added. If found, errors getting tokens will result
 	// in errors connecting.
 	// In K8S - it will be the well-known token file.
-	TokenSource string
+	TokenSource string `json:"tokens,omitempty"`
 
 	// WebpushPublicKey is the client's public key. From the getKey("p256dh") or keys.p256dh field.
 	// This is used for Dest that accepts messages encrypted using webpush spec, and may
@@ -101,7 +154,7 @@ type Dest struct {
 
 	// Cached client
 	httpClient            *http.Client `json:-`
-	InsecureSkipTLSVerify bool
+	InsecureSkipTLSVerify bool `json:"insecure,omitempty"`
 }
 
 func (d *Dest) HttpClient() *http.Client {
@@ -192,6 +245,14 @@ func (d *Dest) AddCACertPEM(pems []byte) error {
 // Helpers for making REST and K8S requests for a k8s-like API.
 
 // RESTRequest is a REST or K8S style request. Will be used with a Dest.
+//
+// It is based on/inspired from kelseyhightower/konfig - which uses the 'raw'
+// K8S protocol to avoid a big dependency. Google, K8S and many other APIs have
+// a raw representation and don't require complex client libraries and depdencies.
+// No code generation or protos are used - raw JSON in []byte is used, caller
+// can handle marshalling.
+//
+// Close to K8S raw REST client - but without the builder style.
 type RESTRequest struct {
 	Method    string
 	Namespace string

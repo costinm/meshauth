@@ -42,14 +42,14 @@ func TestCerts(t *testing.T) {
 
 	// Both alice and bob have the same root CA
 	alice, _ := FromEnv(&MeshAuthCfg{
-		CertDir:     "testdata/alice",
-		TrustDomain: "test.mesh.local",
+		CertDir: "testdata/alice",
+		Domain:  "test.mesh.local",
 	})
 
 	bob, _ := FromEnv(&MeshAuthCfg{
 		AllowedNamespaces: []string{"alicens"},
 		CertDir:           "testdata/bob",
-		TrustDomain:       "test.mesh.local", // bug - fix cert generation for intermdiate
+		Domain:            "test.mesh.local", // bug - fix cert generation for intermdiate
 	})
 
 	// Self-signed certificate, no CA, chain has 1 element.
@@ -73,8 +73,8 @@ func TestCerts(t *testing.T) {
 		// If same config is used, session tickets enabled
 		serverTLSConfg := bobExt.GenerateTLSConfigServer(true)
 		clientTLSConfig := aliceExt.TLSClientConf(&Dest{
-			ALPN: []string{"alpn1", "h2"},
-		}, "bobsni", bobExt.ID)
+			ALPN: []string{"alpn1", "h2"}, SNI: "bobsni",
+		}, "", bobExt.ID)
 
 		tlsc, tlss := tcs.testingTLSPair(ctx, t, serverTLSConfg, clientTLSConfig, sb)
 
@@ -95,7 +95,7 @@ func TestCerts(t *testing.T) {
 	t.Run("Handshake", func(t *testing.T) {
 		serverTLSConfg := bob.GenerateTLSConfigServer(true)
 
-		clientTLSConfig := alice.TLSClientConf(&Dest{}, "bob.bobns.svc.test.mesh.local", "")
+		clientTLSConfig := alice.TLSClientConf(&Dest{SNI: "bob.bobns.svc.test.mesh.local"}, "",  "")
 		tlsc, tlss := tcs.testingTLSPair(ctx, t, serverTLSConfg, clientTLSConfig, sb)
 
 		check(t, tlss, alice)

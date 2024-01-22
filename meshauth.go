@@ -29,11 +29,16 @@ var (
 
 // MeshAuthCfg is used to configure the mesh authentication.
 //
-// Some missing info can be detected from the environment.
+//
 type MeshAuthCfg struct {
-	// Istio-style JWT auth config defining "issuers" and associated key sources.
+
+	// AuthConfig defines the trust config for the node - the list of signers that are trusted for specific
+	// issuers and domains, audiences, etc.
+	//
+	// Based on Istio jwtRules, but generalized to all signer types.
+	//
 	// Authz is separated - this only defines who do we trust (and policies on what we trust it for)
-	AuthConfig *AuthConfig `json:"authn,omitempty"`
+	AuthConfig `json:",inline"`
 
 	// Will attempt to load/reload certificates from this directory.
 	// If empty, FromEnv will auto-detect.
@@ -41,12 +46,15 @@ type MeshAuthCfg struct {
 	// Deprecated - Credential
 	CertDir string `json:"certDir,omitempty"`
 
-	// TrustDomain is extracted from the cert or set by user, used to verify
+	// Trusted roots, in DER format.
+	// Deprecated - AuthConfig
+	RootCertificates [][]byte `json:"roots,omitempty"`
+
+	// Domain is extracted from the cert or set by user, used to verify
 	// peer certificates. If not set, will be populated when cert is loaded.
 	// Should be a real domain with OIDC keys or platform specific.
 	// NOT cluster.local
-	// Deprecated - Credential, AuthConfig
-	TrustDomain string `json:"trustDomain,omitempty"`
+	Domain    string `json:"domain,omitempty"`
 
 	DomainAliases []string `json:"domainAliases,omitempty"`
 
@@ -57,11 +65,13 @@ type MeshAuthCfg struct {
 	// Name of the service account. Can be an email or spiffee or just the naked name.
 	Name string `json:"name,omitempty"`
 
+	// Deprecated - MDS
 	ProjectID string `json:"project_id,omitempty"`
 	GSA       string `json:"gsa,omitempty"`
 
 	// Authz: Additional namespaces to allow access from. If no authz rule is set, 'same namespace'
 	// and 'istio-system' are allowed.
+	// Deprecated - Authz
 	AllowedNamespaces []string
 
 	// If no authz rule is set, 'same namespace' and 'istio-system' are allowed.
@@ -69,28 +79,41 @@ type MeshAuthCfg struct {
 
 	// A Credential named 'default' will be created if not explicitly specified, to identify the current workload.
 	//
-	Credentials []*Credential
+	Credentials []*Credential `json:"credentials,omitempty"`
 
 	// Private key to use in both server and client authentication.
 	// EC256: DER
 	// ED22519: 32B
 	// RSA: DER
+	// Deprecated - Credentials
 	Priv []byte `json:"priv,omitempty"`
+
 	// DER public key
+	// Deprecated - Credentials
 	PublicKey []byte `json:"pub,omitempty"`
+
 	// DER certificate chain
+	// Deprecated - Credentials
 	CertBytes []byte `json:"cert,omitempty"`
 
 	// EC256 key, in base64 format. Used for self-signed identity and webpush.
+	// Deprecated - Credentials
 	EC256Key string
+	// Deprecated - Credentials
 	EC256Pub string
 
 	ec256Priv []byte `json:-`
 
-	// Root CAs, in DER format. CertPool only stores, can't retrieve.
-	RootCertificates [][]byte `json:"roots,omitempty"`
-
 	MDS *util.Metadata `json:"mds,omitempty"`
+
+	// TokenProvider is a URL used to get access tokens, as a GCP-like MDS server,
+	// for client.
+	//
+	// Default is http://169.254.169.245
+	// For local dev and debugging it can be replaced.
+	// It can also be a full http:// or https:// URL.
+	// Deprecated - Credentials
+	TokenProvider    string `json:"token_source,omitempty"`
 
 	// Dst contains pre-configured or discovered properties for destination services.
 	// When running in K8S, "KUBERNETES" is set with the in-cluster config.
@@ -98,10 +121,29 @@ type MeshAuthCfg struct {
 	//
 	// K8S Services, SSH hosts, etc are also represented as Dst.
 	Dst map[string]*Dest `json:"dst,omitempty"`
+
+	// Additional port listeners.
+	// Routes: listen on 127.0.0.1:port
+	// Ingress: listen on 0.0.0.0:port (or actual IP)
+	//
+	// Port proxies: will register a listener for each port, forwarding to the
+	// given address.
+	//
+	// K8S Gateway: key is the section name (converting from list to map)
+	Listeners map[string]*PortListener `json:"listeners,omitempty"`
 }
 
-// Credential identifies a source of client private info to use for authenticating the current workload as
-// a defined principal.
+func NewMeshAuthCfg() MeshAuthCfg{
+	return MeshAuthCfg{
+		Dst: map[string]*Dest{},
+		Listeners: map[string]*PortListener{},
+
+	}
+}
+
+// Credential identifies a source of client private info to use for authentication.
+//
+// It can be a shared secret (token), private key, etc.
 type Credential struct {
 	// Identity asserted by this credential - if not set inferred from JWT/cert
 	Principal string
@@ -120,10 +162,8 @@ type Credential struct {
 	// Alternative: static token source
 	Token string
 
+	// TokenSource is the name of the token provier.
 	// If set, a token source with this name is used. The provider must be set in MeshEnv.AuthProviders
-	// If not found, no tokens will be added. If found, errors getting tokens will result
-	// in errors connecting.
-	// In K8S - it will be the well-known token file.
 	TokenSource string
 
 	// WebpushPublicKey is the client's public key. From the getKey("p256dh") or keys.p256dh field.
@@ -138,11 +178,11 @@ type Credential struct {
 	// If not known, will be populated after the connection.
 	//
 	// TODO: use CertLocation instead - can extract the key from a cert, may also include the cert along.
-	WebpushPublicKey []byte `json:"pub,omitempty"`
+	//WebpushPublicKey []byte `json:"pub,omitempty"`
 
 	// Webpush Auth is a secret shared with the peer, used in sending webpush messages.
 	// TODO: use Token instead (it is a static secret)
-	WebpushAuth []byte `json:"auth,omitempty"`
+	//WebpushAuth []byte `json:"auth,omitempty"`
 }
 
 type AuthzRule struct {
@@ -151,10 +191,16 @@ type AuthzRule struct {
 	AllowedNamespaces []string
 }
 
+// AuthConfig specifies trusted sources for incoming authentication.
+//
+// Common case is as a global config, but may be specified per listener.
+//
+// Unlike Istio, this also covers SSH and Cert public keys - treating all signed mechanisms the same.
+//
 type AuthConfig struct {
 	// Trusted issuers for auth.
 	//
-	Issuers []*TrustConfig `json:"jwtRules,omitempty"`
+	Issuers []*TrustConfig `json:"trust,omitempty"`
 
 	CloudrunIAM bool `json:"cloudruniam,omitempty"`
 
@@ -278,6 +324,59 @@ type TrustConfig struct {
 	m         sync.Mutex `json:-`
 	lastFetch time.Time  `json:-`
 	exp       time.Time  `json:-`
+}
+
+// PortListener represents the configuration for a real port listener.
+// uGate has a set of special listeners that multiplex requests:
+// - socks5 dest
+// - iptables original dst ( may be combined with DNS interception )
+// - NAT dst address
+// - SNI for TLS
+// - :host header for HTTP
+// - ALPN - after TLS handshake
+//
+// Multiplexed channels do an additional lookup to find the listener
+// based on the channel address.
+type PortListener struct {
+	Name string `json:"name,omitempty"`
+
+	// Port number - by default listens on the public address.
+	Port int32 `json:"port,omitempty"`
+
+	// Address address (ex :8080). This is the requested address.
+	//
+	// BTS, SOCKS, HTTP_PROXY and IPTABLES have default ports and bindings, don't
+	// need to be configured here.
+	Address string `json:"address,omitempty"`
+
+	// Port can have multiple protocols:
+	// If missing or other value, this is a dedicated port, specific to a single
+	// destination.
+	// Gateway API defines HTTP, HTTPS, TCP, TLS, UDP
+	// HBone Extensions are SNI, SOCKS5, HBONE, HBONEC, H2C
+	Protocol string `json:"protocol,omitempty"`
+
+	// Extensions
+
+	// ForwardTo where to forward the proxied connections.
+	// Used for accepting on a dedicated port. Will be set as MeshCluster in
+	// the stream, can be mesh node.
+	// host:port format.
+	ForwardTo string `json:"forwardTo,omitempty"`
+
+	// Internal state.
+	NetListener net.Listener `json:-`
+}
+
+func (l *PortListener) Accept() (net.Conn, error) {
+	return l.NetListener.Accept()
+}
+
+func (l *PortListener) Close() error {
+	return l.NetListener.Close()
+}
+func (l *PortListener) Addr() net.Addr {
+	return l.NetListener.Addr()
 }
 
 // MeshAuth represents a workload identity and associated info required for minimal

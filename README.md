@@ -44,25 +44,12 @@ may include cluster and project info.
 [Istio environment](docs/istio_env.md) lists all settings, only a subset will be
 required depending on the platform.
 
-### Platform certificates
-
-If the platform (CertManager, Spire, GKE) provisions each pod with 
-a Spiffee certificate, all information needed is available in the environment.
-
-### K8S with JWT token 
-
-If JWT tokens are not disabled (which is an advanced option), all information can also be extracted from the token.
-
-### VMs / containers / K8S without token
-
-
-
-### Env and Defaults
+### Environment and Defaults
 
 - Root certificates for mesh communication:  - 
   /var/run/secrets/.... (platform provided roots), /etc/ssl/certs/ca-certificates.crt (Istio injected pods default), XDS_ROOT_CA, CA_ROOT_CA, system certificates. 
 
-- Workload identity: 
+- Workload identity: cert provisioned by CertManager, Istio, etc
 
 - Trust domain: extracted from cert or JWT, TRUST_DOMAIN. For GKE expected to be PROJECT_ID.svc.id.goog format.
 
@@ -72,16 +59,6 @@ If JWT tokens are not disabled (which is an advanced option), all information ca
 
 - Service account: SERVICE_ACCOUNT, extracted from cert/JWT
 
-### K8S Cluster
-
-The availability of a K8S cluster will be detected and used to bootstrap:
-
-- KUBECONFIG env variable, ${HOME}/.kube/config - default cluster will be configured, 
-  and if name contains "_" will be interpreted as VENDOR_PROJECT_LOCATION_CLUSTER (gke style)
-
-- in-cluster configs files
-
-- 
 
 ### Certificate provider
 
@@ -177,3 +154,4 @@ Response:
 
 
 ```
+

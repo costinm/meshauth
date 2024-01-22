@@ -248,7 +248,7 @@ func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error)
 	rsaKey := generateKey("")
 	priv = rsaKey
 
-	csr := GenCSRTemplate(a.TrustDomain, san)
+	csr := GenCSRTemplate(a.Domain, san)
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
 
 	encodeMsg := "CERTIFICATE REQUEST"

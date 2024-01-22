@@ -65,8 +65,8 @@ func (a *MeshAuth) initFromCert() {
 		return
 	}
 	_, td, ns, n := a.Spiffee()
-	if a.TrustDomain == "" {
-		a.TrustDomain = td
+	if a.Domain == "" {
+		a.Domain = td
 	}
 	if a.Namespace == "" {
 		a.Namespace = ns
@@ -103,13 +103,13 @@ func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 	var tlsCert tls.Certificate
 	if kty == "ed25519" {
 		_, edpk, _ := ed25519.GenerateKey(rand.Reader)
-		tlsCert, _, _ = auth.generateSelfSigned("ed25519", edpk, auth.Name+"."+auth.TrustDomain)
+		tlsCert, _, _ = auth.generateSelfSigned("ed25519", edpk, auth.Name+"."+auth.Domain)
 	} else if kty == "rsa" {
 		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
-		tlsCert, _, _ = auth.generateSelfSigned("rsa", priv, auth.Name+"."+auth.TrustDomain)
+		tlsCert, _, _ = auth.generateSelfSigned("rsa", priv, auth.Name+"."+auth.Domain)
 	} else {
 		privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.TrustDomain)
+		tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.Domain)
 	}
 	auth.SetTLSCertificate(&tlsCert)
 	return auth
@@ -120,12 +120,16 @@ const (
 	workloadCertDir = "/var/run/secrets/workload-spiffe-credentials"
 
 	// Different from typical Istio  and CertManager key.pem - we can check both
-	privateKey = "private_key.pem"
-
-	workloadRootCAs = "ca-certificates.crt"
-
+	//privateKey = "private_key.pem"
+	//workloadRootCAs = "ca-certificates.crt"
 	// Also different, we'll check all. CertManager uses cert.pem
-	cert = "certificates.pem"
+	//cert = "certificates.pem"
+
+	// CertManager-style
+	workloadRootCAs = "ca.crt"
+	privateKey      = "tls.key"
+
+	cert = "tls.crt"
 
 	// This is derived from CA certs plus all TrustAnchors.
 	// In GKE, it is expected that Citadel roots will be configure using TrustConfig - so they are visible
@@ -549,8 +553,8 @@ func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error 
 	var err error
 	keyFile := filepath.Join(certDir, privateKey)
 	chainFile := filepath.Join(certDir, cert)
-	privPEM, err := ioutil.ReadFile(keyFile)
-	certPEM, err := ioutil.ReadFile(chainFile)
+	privPEM, err := os.ReadFile(keyFile)
+	certPEM, err := os.ReadFile(chainFile)
 
 	kp, err := tls.X509KeyPair(certPEM, privPEM)
 	if err == nil && len(kp.Certificate) > 0 {
@@ -635,8 +639,8 @@ func (a *MeshAuth) AddRoots(rootCertPEM []byte) error {
 // This should be used with a single
 func (a *MeshAuth) TLSClient(ctx context.Context, nc net.Conn,
 	dest *Dest,
-	sni string, remotePub32 string) (*tls.Conn, error) {
-	tlsc := tls.Client(nc, a.TLSClientConf(dest, sni, remotePub32))
+	remotePub32 string) (*tls.Conn, error) {
+	tlsc := tls.Client(nc, a.TLSClientConf(dest, "", remotePub32))
 
 	if err := tlsc.HandshakeContext(ctx); err != nil {
 		// if the context was canceled, return the context error
@@ -653,23 +657,24 @@ func (a *MeshAuth) TLSClient(ctx context.Context, nc net.Conn,
 //
 // sni can override the cluster sni
 // remotePub32 is the cert-baseed identity of a specific endpoint.
-func (a *MeshAuth) TLSClientConf(
-	dest *Dest,
-	sni string, remotePub32 string) *tls.Config {
+func (a *MeshAuth) TLSClientConf(dest *Dest, sni string,
+	 remotePub32 string) *tls.Config {
 
 	pool := a.meshCertPool //  a.trustedCertPool
 	if dest.CACertPEM != nil {
 		pool = dest.CertPool()
 	}
-
+	if sni == "" {
+		sni = dest.SNI
+	}
 	// We need to check the peer WorkloadID in the VerifyPeerCertificate callback.
 	// The tls.Config it is also used for listening, and we might also have concurrent dials.
 	// Clone it so we can check for the specific peer WorkloadID we're dialing here.
 	conf := &tls.Config{
 		// This is not insecure here. We will verify the remote pub in VerifyPeerCertificate.
-		InsecureSkipVerify: true || remotePub32 != "" ||
-			len(dest.URLSANs) > 0 ||
-			len(dest.DNSSANs) > 0,
+		InsecureSkipVerify: dest.InsecureSkipTLSVerify, // || remotePub32 != "" ||
+			//len(dest.URLSANs) > 0 ||
+			//len(dest.DNSSANs) > 0,
 
 		// If dest specifies a pool - use it.
 		// Else use the mesh pool
@@ -687,12 +692,13 @@ func (a *MeshAuth) TLSClientConf(
 		},
 	}
 
-	if conf.InsecureSkipVerify {
+	if len(dest.URLSANs) > 0 || len(dest.DNSSANs) > 0  || remotePub32 != ""{
+		conf.InsecureSkipVerify = true
 		conf.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return a.verifyServerCert(sni, rawCerts, verifiedChains, pool, remotePub32)
+			return a.verifyServerCert(dest, sni, rawCerts, verifiedChains, pool,
+				remotePub32)
 		}
 	}
-
 	return conf
 }
 
@@ -716,8 +722,7 @@ as the key that signed a particular cert.
 // - certificate is valid
 // - if it has a Spiffee identity - verify it is in same namespace or istio-system
 // - else: verify it matches SNI (unless sni is empty). For DNS only will use provided pool or root certs
-func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte,
-	checked [][]*x509.Certificate, pool *x509.CertPool, remotePub32 string) error {
+func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, checked [][]*x509.Certificate, pool *x509.CertPool, remotePub32 string) error {
 
 	if len(checked) != 0 {
 		return nil
@@ -743,6 +748,7 @@ func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte,
 		}
 	}
 
+	// Explicit public key
 	if remotePub32 != "" {
 		chain, err := RawToCertChain(rawCerts)
 		if err != nil {
@@ -775,10 +781,10 @@ func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte,
 		trustDomain := c0.Host
 
 		// TODO: check aliases
-		if trustDomain != a.TrustDomain {
+		if trustDomain != a.Domain {
 
-			log.Println("MTLS: invalid trust domain", trustDomain, "self", a.TrustDomain, peerCert.URIs)
-			return errors.New("invalid trust domain " + trustDomain + " " + a.TrustDomain)
+			log.Println("MTLS: invalid trust domain", trustDomain, "self", a.Domain, peerCert.URIs)
+			return errors.New("invalid trust domain " + trustDomain + " " + a.Domain)
 		}
 
 		if pool == nil {
@@ -802,6 +808,8 @@ func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte,
 		if ns == "istio-system" || ns == a.Namespace {
 			return nil
 		}
+
+		// TODO: check the overrides
 
 		return nil
 	} else {
@@ -855,11 +863,16 @@ func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte,
 			}
 		}
 
-		//for _, n := range peerCert.DNSNames {
-		//	if n == sni {
-		//		return nil
-		//	}
-		//}
+		for _, n := range peerCert.DNSNames {
+			if n == sni {
+				return nil
+			}
+			for _, n1 := range dest.DNSSANs {
+				if n1 == n {
+					return nil
+				}
+			}
+		}
 		for _, n := range peerCert.IPAddresses {
 			if n.String() == sni {
 				return nil
@@ -901,9 +914,9 @@ func (a *MeshAuth) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _
 	}
 	c0 := peerCert.URIs[0]
 	trustDomain := c0.Host
-	if trustDomain != a.TrustDomain {
+	if trustDomain != a.Domain {
 		log.Println("MTLS: invalid trust domain", trustDomain, peerCert.URIs)
-		return errors.New("invalid trust domain " + trustDomain + " " + a.TrustDomain)
+		return errors.New("invalid trust domain " + trustDomain + " " + a.Domain)
 	}
 
 	_, err := peerCert.Verify(x509.VerifyOptions{
@@ -1016,7 +1029,7 @@ func (auth *MeshAuth) SignCertDER(pub crypto.PublicKey, caPrivate crypto.Private
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   sans[0],
-			Organization: []string{auth.TrustDomain},
+			Organization: []string{auth.Domain},
 		},
 		NotBefore: notBefore,
 		NotAfter:  notAfter,

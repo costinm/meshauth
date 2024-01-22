@@ -30,6 +30,85 @@ type TypeMeta struct {
 	APIVersion string `json:"apiVersion,omitempty" protobuf:"bytes,2,opt,name=apiVersion"`
 }
 
+
+type ListOptions struct {
+	// A selector to restrict the list of returned objects by their labels.
+	// Defaults to everything.
+	// +optional
+	LabelSelector string `json:"labelSelector,omitempty" protobuf:"bytes,1,opt,name=labelSelector"`
+	// A selector to restrict the list of returned objects by their fields.
+	// Defaults to everything.
+	// +optional
+	FieldSelector string `json:"fieldSelector,omitempty" protobuf:"bytes,2,opt,name=fieldSelector"`
+
+	// resourceVersion sets a constraint on what resource versions a request may be served from.
+	// See https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions for
+	// details.
+	//
+	// Defaults to unset
+	// +optional
+	ResourceVersion string `json:"resourceVersion,omitempty" protobuf:"bytes,4,opt,name=resourceVersion"`
+
+	// `sendInitialEvents=true` may be set together with `watch=true`.
+	// In that case, the watch stream will begin with synthetic events to
+	// produce the current state of objects in the collection. Once all such
+	// events have been sent, a synthetic "Bookmark" event  will be sent.
+	// The bookmark will report the ResourceVersion (RV) corresponding to the
+	// set of objects, and be marked with `"k8s.io/initial-events-end": "true"` annotation.
+	// Afterwards, the watch stream will proceed as usual, sending watch events
+	// corresponding to changes (subsequent to the RV) to objects watched.
+	//
+	// When `sendInitialEvents` option is set, we require `resourceVersionMatch`
+	// option to also be set. The semantic of the watch request is as following:
+	// - `resourceVersionMatch` = NotOlderThan
+	//   is interpreted as "data at least as new as the provided `resourceVersion`"
+	//   and the bookmark event is send when the state is synced
+	//   to a `resourceVersion` at least as fresh as the one provided by the ListOptions.
+	//   If `resourceVersion` is unset, this is interpreted as "consistent read" and the
+	//   bookmark event is send when the state is synced at least to the moment
+	//   when request started being processed.
+	// - `resourceVersionMatch` set to any other value or unset
+	//   Invalid error is returned.
+	//
+	// Defaults to true if `resourceVersion=""` or `resourceVersion="0"` (for backward
+	// compatibility reasons) and to false otherwise.
+	// +optional
+	SendInitialEvents *bool `json:"sendInitialEvents,omitempty" protobuf:"varint,11,opt,name=sendInitialEvents"`
+}
+
+// EventType defines the possible types of events.
+type EventType string
+
+const (
+	Added    EventType = "ADDED"
+	Modified EventType = "MODIFIED"
+	Deleted  EventType = "DELETED"
+	Bookmark EventType = "BOOKMARK"
+	Error    EventType = "ERROR"
+)
+
+var (
+	DefaultChanSize int32 = 100
+)
+
+// Event represents a single event to a watched resource.
+// +k8s:deepcopy-gen=true
+type Event struct {
+	Type EventType
+
+	// Object is:
+	//  * If Type is Added or Modified: the new state of the object.
+	//  * If Type is Deleted: the state of the object immediately before deletion.
+	//  * If Type is Bookmark: the object (instance of a type being watched) where
+	//    only ResourceVersion field is set. On successful restart of watch from a
+	//    bookmark resourceVersion, client is guaranteed to not get repeat event
+	//    nor miss any events.
+	//  * If Type is Error: *api.Status is recommended; other types may make sense
+	//    depending on context.
+	Object interface{}
+}
+
+
 // ListMeta describes metadata that synthetic resources must have, including lists and
 // various status objects. A resource may have only one of {ObjectMeta, ListMeta}.
 type ListMeta struct {

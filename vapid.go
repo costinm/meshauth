@@ -65,10 +65,10 @@ func (auth *MeshAuth) VAPIDToken(aud string) string {
 	} else {
 		jwt.Aud = []string{"https://" + u.Host}
 	}
-	if auth.TrustDomain != "" {
-		jwt.Sub = auth.TrustDomain
+	if auth.Domain != "" {
+		jwt.Sub = auth.Domain
 		if auth.Name != "" {
-			jwt.Sub = auth.Name + "@" + auth.TrustDomain
+			jwt.Sub = auth.Name + "@" + auth.Domain
 		}
 	}
 	jwt.Exp = time.Now().Unix() + 3600

@@ -65,6 +65,8 @@ import (
 // The test has a static JWK parser and helpers to convert from PEM
 // Also uses jose.Thumbprint to compute Kid
 
+// Authn handles JWK/OIDC authentication.
+//
 type Authn struct {
 	Cfg *AuthConfig
 
@@ -191,10 +193,29 @@ func (ja *Authn) CheckJWT(token string) (jwt *JWT, e error) {
 	}
 
 	// TODO: check audience
+	//if len(idt.Aud) == 0 || !strings.HasPrefix(idt.Aud[0], a.Audience) {
+	//	return nil, errors.New("Invalid audience")
+	//}
 
-	slog.Info("AuthJwt", "iss", idt.Iss, "aud", idt.Aud, "sub", idt.Sub) // , "tok", string(password))
+	slog.Info("AuthJwt", "iss", idt.Iss, "aud", idt.Aud, "email", idt.Email) // , "tok", string(password))
 
 	return idt, nil
+}
+
+func (a *Authn) CheckJwtMap(password string) (tok map[string]string, e error) {
+	idt, err := a.CheckJWT(password)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("AuthJwt", "iss", idt.Iss,
+		"aud", idt.Audience, "sub", idt,
+		"err", err)
+	s := idt.Sub
+	if idt.Email != "" {
+		s= idt.Email
+	}
+	// TODO: check audience against config, domain
+	return map[string]string{"sub": s}, nil
 }
 
 const BearerPrefix = "Bearer "
@@ -263,13 +284,19 @@ func (ja *Authn) FetchAllKeys(ctx context.Context, issuers []*TrustConfig) error
 		return nil
 	}
 	t0 := time.Now()
+	errs := []error{}
 	for _, i := range issuers {
 		err := ja.UpdateKeys(ctx, i)
 		if err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	slog.Info("Issuer init ", "d", time.Since(t0))
+	if time.Since(t0) > 1 * time.Second {
+		slog.Info("Issuer init ", "d", time.Since(t0))
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }
 

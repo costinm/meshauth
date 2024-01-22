@@ -15,19 +15,27 @@ OUT?=${BUILD_DIR}/${REPO}
 
 # Compiling with go build will link the local machine glibc
 # Debian 11 is based on 2.31, testing is 2.36
-GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}/
-
-#DOCKER_REPO?=gcr.io/dmeshgate/${REPO}
+GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 go build -ldflags '-s -w -extldflags "-static"'
 
 # Requires docker login ghcr.io -u vi USERNAME -p TOKEN
-DOCKER_REPO?=ghcr.io/costinm
+GIT_REPO?=${REPO}
+
+# Skaffold can pass this
+# When running pods, label skaffold.dev/run-id is set and used for log watching
+IMAGE_TAG?=latest
+
+DOCKER_REPO?=ghcr.io/costinm/${GIT_REPO}
+
 BASE_DISTROLESS?=gcr.io/distroless/static
 BASE_IMAGE?=debian:testing-slim
+
+IMAGE_REPO?=${DOCKER_REPO}/${BIN}
 
 
 export PATH:=$(PATH):${HOME}/go/bin
 
 echo:
+	env
 	@echo BASE: ${BASE}
 	@echo SRC_DIR: ${SRC_DIR}
 	@echo TOP: ${TOP}
@@ -37,31 +45,71 @@ echo:
 	@echo REPO: ${REPO}
 	@echo MAKEFILE_LIST: $(MAKEFILE_LIST)
 
+	# From skaffold or default
+	@echo IMAGE_TAG: ${IMAGE_TAG}
+	@echo IMAGE_REPO: ${IMAGE_REPO}
+	@echo PUSH_IMAGE: ${PUSH_IMAGE}
+	@echo BUILD_CONTEXT: ${BUILD_CONTEXT}
+
+
+	# When running in a skafold environment
+	# https://skaffold.dev/docs/builders/builder-types/custom/#contract-between-skaffold-and-custom-build-script
+	# BUILD_CONTEXT=/x/sync/dmesh-src/ugate-ws/meshauth
+    # IMAGE=ghcr.io/costinm/meshauth/meshauth-agent:0cc2116-dirty
+    # PUSH_IMAGE=true
+    # SKIP_TEST, PLATFORMS
+    #
+	# Not documented:
+	#  IMAGE_TAG=0cc2116-dirty
+    #  INVOCATION_ID=92f7287ba5a443f0872b11ace7c82ef2
+    # SKAFFOLD_USER=intellij
+    # SKAFFOLD_INTERACTIVE=false
+    # LOGNAME=costin
+    # IMAGE_REPO=ghcr.io/costinm/meshauth/meshauth-agent
+	#
+	#
+    # When running in cluster, https://skaffold.dev/docs/builders/builder-types/custom/#custom-build-script-in-cluster
+    # KUBECONTEXT
+    # NAMESPACE
+    #
+
+# 1. Create a tar file with the desired files (BIN, PUSH_FILES)
+# 2. Send it as DOCKER_REPO/BIN:latest - using BASE_IMAGE as base
+# 3. Save the SHA-based result as IMG
+# 4. Set /BIN as entrypoint and tag again
+_push: IMAGE?=${IMAGE_REPO}:${IMAGE_TAG}
 _push:
-		(export IMG=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
+	@echo Building: ${IMAGE}
+	(export IMG=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
     					  gcrane append -f - -b ${BASE_IMAGE} \
-    						-t ${DOCKER_REPO}/${BIN}:latest \
+					 			-t ${IMAGE}  \
     					   ) && \
-    	gcrane mutate $${IMG} -t ${DOCKER_REPO}/${BIN}:latest --entrypoint /${BIN} \
+    	gcrane mutate $${IMG} -t ${IMAGE_REPO}:latest -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}" --entrypoint /${BIN} 2>/dev/null && \
+    	gcrane mutate $${IMG} -t ${IMAGE} -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}" --entrypoint /${BIN} 2>/dev/null \
     	)
 
-# To create a second image with a different base
+# Last gcrane command should produce the image sha ?
+
+#    	gcrane mutate ${IMAGE} -t ${IMAGE_REPO}:latest \
+
+
+# To create a second image with a different base without uploading the tar again:
 #	gcrane rebase --rebased ${DOCKER_REPO}/gate:latest \
 #	   --original $${SSHDRAW} \
 #	   --old_base ${BASE_DISTROLESS} \
 #	   --new_base ${BASE_DEBUG} \
 
 _oci_base:
-	gcrane mutate ${OCI_BASE} -t ${DOCKER_REPO}/${BIN}:base --entrypoint /${BIN}
+	gcrane mutate ${OCI_BASE} -t ${IMAGE_REPO}:base --entrypoint /${BIN}
 
 _oci_image:
 	(cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
     	gcrane append -f - \
-    				  -b  ${DOCKER_REPO}/${BIN}:base \
-    				  -t ${DOCKER_REPO}/${BIN}:latest )
+    				  -b  ${IMAGE_REPO}:base \
+    				  -t ${IMAGE_REPO}:${IMAGE_TAG} )
 
 _oci_local: build
-	docker build -t costinm/hbone:latest -f tools/Dockerfile ${OUT}/
+	docker build -t costinm/hbone:${IMAGE_TAG} -f tools/Dockerfile ${OUT}/
 
 
 .go-build:
@@ -69,3 +117,14 @@ _oci_local: build
 
 deps:
 	go install github.com/google/go-containerregistry/cmd/gcrane@latest
+
+_cloudrun:
+	gcloud alpha run services replace ${MANIFEST} \
+		  --platform managed --project ${PROJECT_ID} --region ${REGION}
+
+_deps_cloudrun:
+	gcloud components install --quiet \
+        alpha \
+        beta \
+        log-streaming \
+        cloud-run-proxy

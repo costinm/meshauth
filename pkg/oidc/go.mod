@@ -1,12 +1,13 @@
-module oidc
+module github.com/costinm/meshauth/pkg/oidc
 
 go 1.20
 
-replace github.com/costinm/meshauth => ../
+replace github.com/costinm/meshauth => ../../
 
 require (
 	github.com/coreos/go-oidc v2.2.1+incompatible
 	github.com/costinm/meshauth v0.0.0-20230606163944-0cc2116c135d
+	gopkg.in/square/go-jose.v2 v2.6.0
 )
 
 require (
@@ -17,5 +18,4 @@ require (
 	golang.org/x/oauth2 v0.14.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
-	gopkg.in/square/go-jose.v2 v2.6.0 // indirect
 )
