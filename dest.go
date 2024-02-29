@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 )
@@ -33,10 +34,10 @@ includes secure discovery and bootstrap. It is NOT concerned with protocols.
 
 Difference between 'Service frontend' and 'workload endpoint' is subtle and not always visible.
 We have a FQDN:port or VIP:port. The FQDN may resolve (DNS or EDS) to multiple IPs - which
-can be load balancers/waypoints or real endpoints. A host may have multiple IPs too.
+can be Init balancers/waypoints or real endpoints. A host may have multiple IPs too.
 
 From client perspective the main difference is that for Service we may get weights and localities
-and perform advanced client-side load balancing and routing.
+and perform advanced client-side Init balancing and routing.
 
  */
 
@@ -51,21 +52,30 @@ and perform advanced client-side load balancing and routing.
 // K8S clusters can be represented as a Dest - rest.Config Host is Addr, CACertPEM
 //
 // Unlike K8S and Envoy, the port is not required.
+//
+// This is part of the config - either static or on-demand. The key is the virtual
+// address or IP:port that is either captured or set as backendRef in routes.
 type Dest struct {
 
+	// Addr is the address of the destination.
+	//
 	// For HTTP, Addr is the URL, including any required path prefix, for the destination.
 	//
 	// For TCP, Addr is the TCP address - VIP:port or DNS:port format. tcp:// is assumed.
+	//
 	// For K8S service it should be in the form serviceName.namespace.svc:svcPort
-	// The cluster suffix is assumed to be 'cluster.local' or the custom k8s suffix.
+	// The cluster suffix is assumed to be 'cluster.local' or the custom k8s suffix,
+	// equivalent to cluster.server in kubeconfig.
 	//
 	// This can also be an 'original dst' address for individual endpoints.
 	//
 	// Individual IPs (real or relay like waypoints or egress GW, etc) will be in
 	// the info.addrs field.
-	// Equivalent to cluster.server in kubeconfig.
 	Addr string `json:"addr,omitempty"`
 
+	// Proto determines how to talk with the Dest.
+	// Could be 'hbone' (compat with Istio), 'h2c', 'h2', 'ssh', etc.
+	// If not set - Dial will use regular TCP or TLS, depending on the other settings.
 	Proto string `json:"protocol,omitempty"`
 
 	//FQDN []string `json:"fqdn,omitempty"`
@@ -154,40 +164,123 @@ type Dest struct {
 
 	// Cached client
 	httpClient            *http.Client `json:-`
+
+	// If set, the destination is using HTTP protocol - and this is the roundtripper to use.
+	// HttpClient() returns a http client initialized for this destination.
+	// For special cases ( reverse connections in h2r ) it will be a *http2.ClientConn.
+	//
+	RoundTripper            http.RoundTripper `json:-`
 	InsecureSkipTLSVerify bool `json:"insecure,omitempty"`
+
+	Dialer ContextDialer `json:-`
+
+	// L4Secure is set if the destination can be reached over a secure L4 network (ambient, VPC, IPSec, secure CNI, etc)
+	L4Secure bool `json:"l4secure,omitempty"`
+
+	// Last packet or registration from the peer.
+	LastSeen time.Time `json:"-"`
+
+
+	Backoff time.Duration `json:"-"`
+	Dynamic bool `json:"-"`
 }
 
+// ContextGetter allows getting a Context associated with a stream or
+// request or other high-level object. Based on http.Request
+type ContextGetter interface {
+	Context() context.Context
+}
+
+
+
+// ContextDialer is same with x.net.proxy.ContextDialer
+// Used to create the actual connection to an address using the mesh.
+// The result may have metadata, and be an instance of util.Stream.
+//
+// A uGate implements this interface, it is the primary interface
+// for creating streams where the caller does not want to pass custom
+// metadata. Based on net and addr and handshake, if destination is
+// capable we will upgrade to BTS and pass metadata. This may also
+// be sent via an egress gateway.
+//
+// For compatibility, 'net' can be "tcp" and addr a mangled hostname:port
+// Mesh addresses can be identified by the hostname or IP6 address.
+// External addresses will create direct connections if possible, or
+// use egress server.
+//
+// TODO: also support 'url' scheme
+type ContextDialer interface {
+	// Dial with a context based on tls package - 'once successfully
+	// connected, any expiration of the context will not affect the
+	// connection'.
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
+// HttpClient returns a http client configured to talk with this Dest using a secure connection.
+// - if CACertPEM is set, will be used instead of system
+//
+// The client is cached in Dest.
 func (d *Dest) HttpClient() *http.Client {
 	if d.httpClient != nil {
 		return d.httpClient
 	}
 
-	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: d.InsecureSkipTLSVerify,
-	}
-
-	if len(d.CACertPEM) != 0 {
-		tlsConfig.RootCAs = x509.NewCertPool()
-		if !tlsConfig.RootCAs.AppendCertsFromPEM(d.CACertPEM) {
-			return nil //, errors.New("certificate authority doesn't contain any certificates")
+	if d.L4Secure {
+		d.httpClient = &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+			},
 		}
-	}
+	} else {
+		tlsConfig := &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: d.InsecureSkipTLSVerify,
+		}
 
-	d.httpClient = &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		},
+		if len(d.CACertPEM) != 0 {
+			tlsConfig.RootCAs = x509.NewCertPool()
+			if !tlsConfig.RootCAs.AppendCertsFromPEM(d.CACertPEM) {
+				return nil //, errors.New("certificate authority doesn't contain any certificates")
+			}
+		}
+
+		d.httpClient = &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+			},
+		}
 	}
 
 	return d.httpClient
 }
 
+func (d *Dest) RoundTrip(r *http.Request) (*http.Response, error) {
+	return d.HttpClient().Do(r)
+}
+
+// WIP
+func (d *Dest) DialTLS(a *MeshAuth, nc net.Conn) (*tls.Conn, error) {
+	tlsClientConfig := a.TLSClientConf(d, d.SNI, d.Addr)
+	tlsTun := tls.Client(nc, tlsClientConfig)
+	ctx, cf := context.WithTimeout(context.Background(), 3 * time.Second)
+	defer cf()
+
+	err := tlsTun.HandshakeContext(ctx)
+
+	if err != nil {
+		return nil, err
+	}
+	return tlsTun, nil
+}
+
+
 func (d *Dest) GetCACertPEM() []byte {
 	return d.CACertPEM
 }
 
+// AddToken will add a token to the request, using the 'token source' of the
+// destination.
 func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
 	if c.TokenSource != "" {
 		tp := ma.AuthProviders[c.TokenSource]
@@ -209,6 +302,8 @@ func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
 		//	req.Header.Add(k, v)
 		//}
 	}
+
+	// TODO: use default workload identity token source for MeshAuth
 
 	return nil
 }
@@ -329,4 +424,19 @@ func (d *Dest) Load(ctx context.Context, obj interface{}, kind, ns string, name 
 	}
 
 	return nil
+}
+
+
+func (n *Dest) BackoffReset() {
+	n.Backoff = 0
+}
+
+func (n *Dest) BackoffSleep() {
+	if n.Backoff == 0 {
+		n.Backoff = 5 * time.Second
+	}
+	time.Sleep(n.Backoff)
+	if n.Backoff < 5*time.Minute {
+		n.Backoff = n.Backoff * 2
+	}
 }

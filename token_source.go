@@ -133,7 +133,7 @@ func (k *K8STokenSource) Do(r *http.Request) ([]byte, error) {
 //}
 //
 
-// Old: LoadMeshEnv will load the 'mesh-env' config map in istio-system, and save the
+// Old: LoadMeshEnv will Init the 'mesh-env' config map in istio-system, and save the
 // settings. It had broad RBAC permissions. and included GCP settings.
 //
 // This is required for:

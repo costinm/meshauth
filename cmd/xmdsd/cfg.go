@@ -14,7 +14,7 @@ import (
 )
 
 type Config struct {
-	meshauth.MeshAuthCfg `json:inline`
+	meshauth.MeshCfg `json:inline`
 
 	// If set, init a local CA based on the configuration.
 	CA *meshauth.CAConfig `json:"ca,omitempty"`
@@ -103,7 +103,7 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	// Auto-detect the environment and SetupAgent mesh certificates, if any.
 	// TODO: detect the istio-mounted istio-ca scoped token location and use it as a source.
 	// On CloudRun or regular VMs - will not detect anything unless a secret is mounted.
-	ma, err := meshauth.FromEnv(&maCfg.MeshAuthCfg)
+	ma, err := meshauth.FromEnv(&maCfg.MeshCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +147,7 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	}
 
 	// Emulated MDS server
-	mux.HandleFunc("/computeMetadata/v1/", ma.MDS.ServeHTTP)
+	mux.HandleFunc("/computeMetadata/v1/", ma.MDS.HandleMDS)
 
 	// TODO: handler to return the root cert, root SHA, public - and workload sha (DANE)
 

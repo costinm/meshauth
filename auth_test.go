@@ -30,7 +30,7 @@ func TestJWKS(t *testing.T) {
 	laddr := startServer(t, ca, mauth)
 	// TODO: start an auth server
 
-	cfg := &AuthConfig{
+	cfg := &AuthnConfig{
 		Issuers: []*TrustConfig{
 			&TrustConfig{
 				Issuer: "https://accounts.google.com",
@@ -105,7 +105,7 @@ func startServer(t *testing.T, ca *CA, mauth *MeshAuth) string {
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	addr := fmt.Sprintf("localhost:%s", p)
 
-	authn := NewAuthn(&AuthConfig{
+	authn := NewAuthn(&AuthnConfig{
 		Issuers: []*TrustConfig{
 			&TrustConfig{
 				Issuer: "http://" + addr,
@@ -149,7 +149,7 @@ func checkJWT(t *testing.T, jwt string) {
 	// Example of google JWT in cloudrun:
 	// eyJhbGciOiJSUzI1NiIsImtpZCI6IjBlNzJkYTFkZjUwMWNhNmY3NTZiZjEwM2ZkN2M3MjAyOTQ3NzI1MDYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiIzMjU1NTk0MDU1OS5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF1ZCI6IjMyNTU1OTQwNTU5LmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MzY2MjYxNjgxNjMwMTM4NTIzIiwiZW1haWwiOiJjb3N0aW5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiJ1MTIwMzhrTTh2THcyZGN0dnVvbTdBIiwiaWF0IjoxNzAwODg0MDAwLCJleHAiOjE3MDA4ODc2MDB9.SIGNATURE_REMOVED_BY_GOOGLE"
 
-	cfg := &AuthConfig{}
+	cfg := &AuthnConfig{}
 
 	cfg.Issuers = []*TrustConfig{{Issuer: "https://accounts.google.com"}}
 
@@ -186,7 +186,7 @@ func TestVapid(t *testing.T) {
 	}
 	log.Println(len(rfcP), rfcT)
 
-	alice := NewMeshAuth(&MeshAuthCfg{
+	alice := NewMeshAuth(&MeshCfg{
 		Domain: "test.sender"}).InitSelfSigned("")
 
 	bobToken := alice.VAPIDToken("bob")

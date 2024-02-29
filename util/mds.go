@@ -122,6 +122,29 @@ type MDS struct {
 
 }
 
+// NewMDSClient returns a client for an GCP MDS-like server.
+//
+// It can return JWT tokens for the 'primary' service account, as well
+// as metadata.
+func NewMDSClient(mdsBase string) *MDS {
+	if mdsBase == "" {
+		mdsBase = os.Getenv("GCE_METADATA_HOST")
+	}
+	if mdsBase == "" {
+		mdsBase = "169.254.169.254"
+	}
+	if !strings.Contains(mdsBase, "/") {
+		mdsBase = "http://" + mdsBase + "/computeMetadata/v1/"
+	}
+	mds := &MDS{
+		MDSBase: mdsBase,
+		hc:  http.DefaultClient,
+	}
+
+	return mds
+}
+
+
 // Subscribe subscribes to a value from the metadata service.
 // The suffix is appended to "http://${GCE_METADATA_HOST}/computeMetadata/v1/".
 // The suffix may contain query parameters.
@@ -183,7 +206,10 @@ func (suffix NotDefinedError) Error() string {
 //	     https://www.googleapis.com/auth/cloud-platform
 //	 ],
 //	}
-func (mds *MDS) GetTokenAud(aud string) (string, error) {
+func (mds *MDS) GetToken(ctx1 context.Context, aud string) (string, error) {
+	if mds == nil {
+		return "", nil
+	}
 	// TODO: check well-known files
 	if _, err := os.Stat(tokenFile); err == nil {
 		data, err := ioutil.ReadFile(tokenFile)
@@ -194,7 +220,7 @@ func (mds *MDS) GetTokenAud(aud string) (string, error) {
 		}
 	}
 
-	ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cf := context.WithTimeout(ctx1, 5*time.Second)
 	defer cf()
 	req, err := http.NewRequestWithContext(ctx, "GET", mds.MDSBase+fmt.Sprintf("instance/service-accounts/default/identity?audience=%s", aud), nil)
 	if err != nil {

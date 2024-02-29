@@ -77,13 +77,16 @@ func (a *MeshAuth) initFromCert() {
 
 	publicKey := a.leaf().PublicKey
 	a.PublicKey = MarshalPublicKey(publicKey)
-	a.Priv = MarshalPrivateKey(a.Cert.PrivateKey)
+	if a.Priv == "" {
+		a.Priv = string(MarshalPrivateKey(a.Cert.PrivateKey))
+	}
 	a.PubID = PublicKeyBase32SHA(PublicKey(publicKey))
 
 	a.PublicKeyBase64 = base64.RawURLEncoding.EncodeToString(a.PublicKey)
 
 	if pk, ok := a.Cert.PrivateKey.(*ecdsa.PrivateKey); ok {
 		a.ec256Priv = pk.D.Bytes()
+		a.EC256Key = base64.RawURLEncoding.EncodeToString(pk.D.Bytes())
 	}
 
 	a.VIP6 = Pub2VIP(a.PublicKey)
@@ -91,6 +94,13 @@ func (a *MeshAuth) initFromCert() {
 	// Based on the primary EC256 key
 	if a.ID == "" {
 		a.ID = PublicKeyBase32SHA(publicKey)
+	}
+
+	// Setting a cert also implies trusting it's signer.
+	if a.Cert != nil && len(a.Cert.Certificate) > 1 {
+		last := a.Cert.Certificate[len(a.Cert.Certificate)-1]
+
+		a.AddRootDER(last)
 	}
 }
 
@@ -213,7 +223,7 @@ func (auth *MeshAuth) Host2ID(host string) string {
 	return strings.ToUpper(host)
 }
 
-// Will load the credentials and create an Auth object.
+// Will Init the credentials and create an Auth object.
 //
 // This uses pilot-agent or some other platform tool creating ./var/run/secrets/istio.io/{key,cert-chain}.pem
 // or /var/run/secrets/workload-spiffe-credentials
@@ -228,9 +238,8 @@ func (auth *MeshAuth) Host2ID(host string) string {
 
 // SetCertPEM explicitly set the certificate and key. The cert will not be rotated - use a dir to reload
 // or call this function with fresh certs before it expires.
-func (a *MeshAuth) SetCertPEM(privatePEM []byte, chainPEM []string) error {
-	chainPEMCat := strings.Join(chainPEM, "\n")
-	tlsCert, err := tls.X509KeyPair([]byte(chainPEMCat), privatePEM)
+func (a *MeshAuth) SetCertPEM(privatePEM string, chainPEMCat string) error {
+	tlsCert, err := tls.X509KeyPair([]byte(chainPEMCat), []byte(privatePEM))
 	if err != nil {
 		return err
 	}
@@ -275,13 +284,15 @@ func (a *MeshAuth) GetCertificate(ctx context.Context, sni string) (*tls.Certifi
 		}
 
 		if a.CertDir != "" {
-			c, err := loadCertFromDir(a.CertDir)
+			c, _, err := loadCertFromDir(a.CertDir)
 			if err == nil {
-				if !c.Leaf.NotAfter.Before(time.Now()) {
+				if a.Cert == nil || !c.Leaf.NotAfter.Before(time.Now()) {
 					a.Cert = c
 				}
 			}
+			return c, nil
 		}
+		return nil, nil
 	}
 
 	if a.CertMap == nil {
@@ -307,8 +318,12 @@ func (a *MeshAuth) GetCertificate(ctx context.Context, sni string) (*tls.Certifi
 	return a.Cert, nil
 }
 
-func loadCertFromDir(dir string) (*tls.Certificate, error) {
-	// Load cert from file
+// loadCertFromDir will attempt to read from a cert directory, attempting well-known file names
+// private key and cert may also be set in the config 'priv' and 'cert' fields.
+//
+// Because it is not possible to get back the cert bytes from cert, return it as well.
+func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
+	// SetCert cert from file
 	keyFile := filepath.Join(dir, "key.pem")
 	keyBytes, err := ioutil.ReadFile(keyFile)
 	if err != nil {
@@ -316,27 +331,27 @@ func loadCertFromDir(dir string) (*tls.Certificate, error) {
 		keyBytes, err = ioutil.ReadFile(keyFile)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	certBytes, err := ioutil.ReadFile(filepath.Join(dir, "cert-chain.pem"))
 	if err != nil {
 		certBytes, err = ioutil.ReadFile(filepath.Join(dir, cert))
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
-		return nil, errors.New("missing certificate")
+		return nil, nil, errors.New("missing certificate")
 	}
 	tlsCert.Leaf, _ = x509.ParseCertificate(tlsCert.Certificate[0])
 
-	return &tlsCert, nil
+	return &tlsCert, certBytes, nil
 }
 
 //func (a *MeshAuth) waitAndInitFromDir() error {
@@ -372,7 +387,7 @@ func (a *MeshAuth) initFromDirPeriodicStart() error {
 	return err
 }
 
-// initFromDir will load the certificate and roots
+// initFromDir will Init the certificate and roots
 func (a *MeshAuth) initFromDir() error {
 	_, err := a.GetCertificate(context.Background(), "")
 	if err != nil {
@@ -460,9 +475,10 @@ func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
 	case *ecdsa.PrivateKey:
 		encodedKey, _ := x509.MarshalECPrivateKey(k)
 		return pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
-	case *ed25519.PrivateKey:
+	case ed25519.PrivateKey:
+		// TODO: what is the std encoding for ed25529 ?
+		return []byte(base64.RawURLEncoding.EncodeToString(k))
 	}
-	// TODO: ed25529
 
 	return nil
 }
@@ -540,7 +556,7 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 //     If workload certs are platform-provisioned: extract trust domain, namespace, name, pod id from cert.
 //
 // - Detect the WORKLOAD_SERVICE_ACCOUNT, trust domain from JWT or mesh-env
-// - Use WORKLOAD_CERT json to load the config for the CSR, create a CSR
+// - Use WORKLOAD_CERT json to Init the config for the CSR, create a CSR
 // - Call CSRSigner.
 // - Save the certificates if running as root or an output dir is set. This will use CAS naming convention.
 //
@@ -651,6 +667,11 @@ func (a *MeshAuth) TLSClient(ctx context.Context, nc net.Conn,
 	}
 
 	return tlsc, nil
+}
+
+// HttpClient returns a http.Client configured based on the security settings for Dest.
+func (a *MeshAuth) HttpClient(dest *Dest) *http.Client {
+	return dest.HttpClient()
 }
 
 // TLSClientConf returns a config for a specific cluster.
@@ -1225,7 +1246,7 @@ func (auth *MeshAuth) GetCerts() map[string]*tls.Certificate {
 	if _, err := os.Stat("./etc/certs/key.pem"); !os.IsNotExist(err) {
 		crt, err := tls.LoadX509KeyPair("./etc/certs/cert-chain.pem", "./etc/certs/key.pem")
 		if err != nil {
-			log.Println("Failed to load system istio certs", err)
+			log.Println("Failed to Init system istio certs", err)
 		} else {
 			certMap["istio"] = &crt
 			if crt.Leaf != nil {
@@ -1245,7 +1266,7 @@ func (auth *MeshAuth) GetCerts() map[string]*tls.Certificate {
 				cert, err := tls.LoadX509KeyPair(base+".crt",
 					base+".key")
 				if err != nil {
-					log.Println("ACME: Failed to load ", s, err)
+					log.Println("ACME: Failed to Init ", s, err)
 				} else {
 					certMap[s] = &cert
 					log.Println("ACME: Loaded cert for ", s)

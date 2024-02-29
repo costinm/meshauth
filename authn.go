@@ -67,8 +67,10 @@ import (
 
 // Authn handles JWK/OIDC authentication.
 //
+// A server may have different Authn configs for different listeners/hosts/routes - but typically one global
+// config is more common.
 type Authn struct {
-	Cfg *AuthConfig
+	Cfg *AuthnConfig
 
 	Verify func(context.Context, *TrustConfig, string) error
 
@@ -78,9 +80,9 @@ type Authn struct {
 	Issuers map[string]*TrustConfig `json:-`
 }
 
-func NewAuthn(cfg *AuthConfig) *Authn {
+func NewAuthn(cfg *AuthnConfig) *Authn {
 	if cfg == nil {
-		cfg = &AuthConfig{}
+		cfg = &AuthnConfig{}
 	}
 	an := &Authn{Cfg: cfg, Issuers: map[string]*TrustConfig{}}
 	an.Client = http.DefaultClient
@@ -144,8 +146,8 @@ func (ja *Authn) CheckJWT(token string) (jwt *JWT, e error) {
 	}
 
 	if ja.Cfg.CloudrunIAM && idt.Iss == "https://accounts.google.com" {
-		// Special case: Cloudrun IAM will check the token and forward it without signature.
-		//slog.Info("IAM JWT", "tok", idt)
+		// Special case: Cloudrun IAM will check the token and forward it without
+		// signature, for the developer token.
 		return idt, nil
 	}
 
@@ -164,7 +166,7 @@ func (ja *Authn) CheckJWT(token string) (jwt *JWT, e error) {
 	kid := idt.Head.Kid
 	k := issuer.KeysByKid[kid]
 	if k == nil {
-		// Lazy load
+		// Lazy Init
 		issuer.m.Lock()
 		k = issuer.KeysByKid[kid]
 		if k == nil {
@@ -193,12 +195,27 @@ func (ja *Authn) CheckJWT(token string) (jwt *JWT, e error) {
 	}
 
 	// TODO: check audience
-	//if len(idt.Aud) == 0 || !strings.HasPrefix(idt.Aud[0], a.Audience) {
-	//	return nil, errors.New("Invalid audience")
-	//}
+	aud := ""
+	for _, a := range idt.Aud {
+		for _, b := range ja.Cfg.Audiences {
+			if a == b || strings.HasPrefix(a, b) {
+				aud = a
+			}
+		}
+	}
+	if aud == "" {
+		slog.Info("Invalid aud ", "iss", idt.Iss,
+			"aud", idt.Aud, "email", idt.Email) // , "tok", string(password))
+		return nil, errors.New("invalid audience")
+	}
 
-	slog.Info("AuthJwt", "iss", idt.Iss, "aud", idt.Aud, "email", idt.Email) // , "tok", string(password))
+	slog.Info("AuthJwt", "iss", idt.Iss,
+		"aud", idt.Aud, "email", idt.Email) // , "tok", string(password))
 
+	// Use email as sub
+	if idt.Email != "" {
+		idt.Sub = idt.Email
+	}
 	return idt, nil
 }
 
@@ -207,15 +224,10 @@ func (a *Authn) CheckJwtMap(password string) (tok map[string]string, e error) {
 	if err != nil {
 		return nil, err
 	}
-	slog.Info("AuthJwt", "iss", idt.Iss,
-		"aud", idt.Audience, "sub", idt,
-		"err", err)
-	s := idt.Sub
-	if idt.Email != "" {
-		s= idt.Email
-	}
+
 	// TODO: check audience against config, domain
-	return map[string]string{"sub": s}, nil
+
+	return map[string]string{"sub": idt.Sub}, nil
 }
 
 const BearerPrefix = "Bearer "
@@ -227,19 +239,19 @@ const BearerPrefix = "Bearer "
 // Example: curl -v https://accounts.google.com/.well-known/openid-configuration
 type OIDCDiscDoc struct {
 	// Should match the one in the URL
-	Issuer string `json:"issuer"`
+	Issuer string `json:"issuer,omitempty"`
 
 	// Same as the URI in the Istio config - contains the keys.
 	// Example: "https://www.googleapis.com/oauth2/v3/certs"
-	JWKSURL string `json:"jwks_uri"`
+	JWKSURL string `json:"jwks_uri,omitempty"`
 
 	// Not used
-	AuthURL       string `json:"authorization_endpoint"`
-	DeviceAuthURL string `json:"device_authorization_endpoint"`
-	TokenURL      string `json:"token_endpoint"`
-	UserInfoURL   string `json:"userinfo_endpoint"`
+	AuthURL       string `json:"authorization_endpoint,omitempty"`
+	DeviceAuthURL string `json:"device_authorization_endpoint,omitempty"`
+	TokenURL      string `json:"token_endpoint,omitempty"`
+	UserInfoURL   string `json:"userinfo_endpoint,omitempty"`
 
-	Algorithms []string `json:"id_token_signing_alg_values_supported"`
+	Algorithms []string `json:"id_token_signing_alg_values_supported,omitempty"`
 }
 
 // UpdateWellKnown downloads the JWKS from the well-known location
@@ -363,6 +375,7 @@ func (ja *Authn) ConvertJWKS(i *TrustConfig) error {
 	if err != nil {
 		return fmt.Errorf("oidc: failed to decode keys: %v %s", err, body)
 	}
+
 	// Map of 'kid' to key
 	i.KeysByKid = map[string]interface{}{}
 	for _, ks := range keySet.Keys {

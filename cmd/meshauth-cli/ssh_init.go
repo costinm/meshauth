@@ -11,7 +11,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// Load or generate a SSH node config.
+// SetCert or generate a SSH node config.
 // To simplify the code and testing, the SSH node will only interact with a config - which
 // can be loaded from JSON file or an MDS server, to bootstrap.
 

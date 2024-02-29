@@ -14,7 +14,7 @@ import (
 )
 
 type Config struct {
-	meshauth.MeshAuthCfg `json:inline`
+	meshauth.MeshCfg `json:inline`
 
 	// If set, init a local CA based on the configuration.
 	CA *meshauth.CAConfig `json:"ca,omitempty"`
@@ -102,7 +102,7 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	// Auto-detect the environment and SetupAgent mesh certificates, if any.
 	// TODO: detect the istio-mounted istio-ca scoped token location and use it as a source.
 	// On CloudRun or regular VMs - will not detect anything unless a secret is mounted.
-	ma, err := meshauth.FromEnv(&maCfg.MeshAuthCfg)
+	ma, err := meshauth.FromEnv(&maCfg.MeshCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -151,20 +151,11 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	}
 
 	// Emulated MDS server
-	mux.HandleFunc("/computeMetadata/v1/", ma.MDS.ServeHTTP)
+	mux.HandleFunc("/computeMetadata/v1/", ma.MDS.HandleMDS)
 
 	// TODO: handler to return the root cert, root SHA, public - and workload sha (DANE)
 
 	authc := &authz.Authz{}
-
-	// Envoy proxy auth.
-	//
-	// TODO: check incoming JWTs, convert to headers
-	// TODO: implement Istio authz policy
-	// TODO: add prefix to envoy auth
-	// TODO: add a JWT identifying the gateway (after determining the identity
-	// using the IP and 'same node')
-	mux.HandleFunc("/", authc.HandleExtAuthzAgent)
 
 	//// start an echo server for testing and to reflect the requests
 	//go http.ListenAndServe(":15099", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -173,7 +164,8 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 	//	writer.WriteHeader(200)
 	//	fmt.Fprintf(writer, "%s %v", request.Host, request.Header)
 	//}))
-	mux.HandleFunc("/echo", func(writer http.ResponseWriter, request *http.Request) {
+
+	mux.HandleFunc("/echo/", func(writer http.ResponseWriter, request *http.Request) {
 		host := request.Host
 		fmt.Fprintf(writer, "host: %s, req: %s, headers: %v", host, request.RequestURI, request.Header)
 		b := make([]byte, 1024)
@@ -188,10 +180,26 @@ func SetupAgent(ctx context.Context, maCfg *Config) (*meshauth.MeshAuth, error) 
 		}
 	})
 
-	mux.HandleFunc("/wait", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("/wait/", func(writer http.ResponseWriter, request *http.Request) {
 		host := request.Host
 		fmt.Fprintf(writer, "host: %s, req: %s, headers: %v", host, request.RequestURI, request.Header)
 		time.Sleep(60 * time.Second)
+	})
+
+	// Envoy proxy auth.
+	//
+	// TODO: check incoming JWTs, convert to headers
+	// TODO: implement Istio authz policy
+	// TODO: add prefix to envoy auth
+	// TODO: add a JWT identifying the gateway (after determining the identity
+	// using the IP and 'same node')
+	mux.HandleFunc("/ext_authz/", authc.HandleExtAuthzAgent)
+
+	// Required for golang detection of GCP MDS - there is no header except user-agent
+	mux.HandleFunc("/", func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Add("Metadata-Flavor", "Google")
+		w.WriteHeader(200)
+		log.Println("DefaultCredentials check from", request.RemoteAddr)
 	})
 
 	return ma, nil

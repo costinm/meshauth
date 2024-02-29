@@ -1,6 +1,7 @@
 package meshauth
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
@@ -14,9 +15,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/big"
+	"net/http"
+	"net/http/httputil"
+	"os"
 	"strings"
 )
 
@@ -98,11 +104,12 @@ func NewWebpushEncryption(uapub, auth []byte) *WebpushEncryption {
 }
 
 // NewWebpushDecryption creates a context for decrypting message by a UA.
-func NewWebpushDecryption(uapriv, uapub, auth []byte) *WebpushEncryption {
+func NewWebpushDecryption(uapriv string, uapub, auth []byte) *WebpushEncryption {
+	uaprivb, _ := base64.URLEncoding.DecodeString(uapriv)
 	return &WebpushEncryption{
 		Auth:      auth,
 		UAPublic:  uapub,
-		UAPrivate: uapriv,
+		UAPrivate: uaprivb,
 	}
 }
 
@@ -465,4 +472,134 @@ func sharedSecret(curve elliptic.Curve, pub, priv []byte) ([]byte, error) {
 	}
 	x, _ := curve.ScalarMult(publicX, publicY, priv)
 	return x.Bytes(), nil
+}
+
+// Send an encrypted message to a node.
+func SendMessage(hc *http.Client, subs string, vapid *MeshAuth, show bool, msg string) {
+	var err error
+	if msg == "" {
+		msgB, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Println("Failed to read message")
+			os.Exit(3)
+		}
+		msg = string(msgB)
+	}
+
+	destURL := ""
+	var destPubK []byte
+	var authk []byte
+
+	if subs != "" {
+		to, err := SubscriptionFromJSON([]byte(subs))
+		if err != nil {
+			fmt.Println("Invalid endpoint "+flag.Arg(1), err)
+			os.Exit(3)
+		}
+		destURL = to.Endpoint
+		destPubK = to.Key
+		authk = to.Auth
+		if len(authk) == 0 {
+			authk = []byte{1}
+		}
+	}
+
+	ec := NewWebpushEncryption(destPubK, authk)
+	c, _ := ec.Encrypt([]byte(msg))
+
+	ah := vapid.VAPIDToken(destURL)
+
+	if show {
+		payload64 := base64.StdEncoding.EncodeToString(c)
+		cmd := "echo -n " + payload64 + " | base64 -d > /tmp/$$.bin; curl -XPOST --data-binary @/tmp/$$.bin"
+		cmd += " -proxy 127.0.0.1:5224"
+		cmd += " -Httl:0"
+		cmd += " -H\"authorization:" + ah + "\""
+		fmt.Println(cmd + " " + destURL)
+
+		return
+	}
+
+	req, _ := http.NewRequest("POST", destURL, bytes.NewBuffer(c))
+	req.Header.Add("ttl", "0")
+	req.Header.Add("authorization", ah)
+	req.Header.Add("Content-Encoding", "aes128gcm")
+
+	res, err := hc.Do(req)
+
+	if res == nil {
+		fmt.Println("Failed to send ", err)
+
+	} else if err != nil {
+		fmt.Println("Failed to send ", err)
+
+	} else if res.StatusCode != 201 {
+		//dmpReq, err := httputil.DumpRequest(req, true)
+		//fmt.Printf(string(dmpReq))
+		dmp, _ := httputil.DumpResponse(res, true)
+		fmt.Println(string(dmp))
+		fmt.Println("Failed to send ", err, res.StatusCode)
+
+	//} else if *verbose {
+	//	dmpReq, _ := httputil.DumpRequest(req, true)
+	//	fmt.Printf(string(dmpReq))
+	//	dmp, _ := httputil.DumpResponse(res, true)
+	//	fmt.Printf(string(dmp))
+	}
+}
+
+// SubscriptionFromJSON is a convenience function that takes a JSON encoded
+// PushSubscription object acquired from the browser and returns a pointer to a
+// node.
+func SubscriptionFromJSON(b []byte) (*Subscription, error) {
+	var sub struct {
+		Endpoint string
+		Keys     struct {
+			P256dh string
+			Auth   string
+		}
+	}
+	if err := json.Unmarshal(b, &sub); err != nil {
+		return nil, err
+	}
+
+	b64 := base64.URLEncoding.WithPadding(base64.NoPadding)
+
+	// Chrome < 52 incorrectly adds padding when Base64 encoding the values, so
+	// we need to strip that out
+	key, err := b64.DecodeString(strings.TrimRight(sub.Keys.P256dh, "="))
+	if err != nil {
+		return nil, err
+	}
+
+	auth, err := b64.DecodeString(strings.TrimRight(sub.Keys.Auth, "="))
+	if err != nil {
+		return nil, err
+	}
+
+	return &Subscription{sub.Endpoint, key, auth, ""}, nil
+}
+
+// Subscription holds the useful values from a PushSubscription object acquired
+// from the browser.
+//
+// https://w3c.github.io/push-api/
+//
+// Returned as result of /subscribe
+type Subscription struct {
+	// Endpoint is the URL to send the Web Push message to. Comes from the
+	// endpoint field of the PushSubscription.
+	Endpoint string
+
+	// Key is the client's public key. From the getKey("p256dh") or keys.p256dh field.
+	Key []byte
+
+	// Auth is a value used by the client to validate the encryption. From the
+	// keys.auth field.
+	// The encrypted aes128gcm will have 16 bytes authentication tag derived from this.
+	// This is the pre-shared authentication secret.
+	Auth []byte
+
+	// Used by the UA to receive messages, as PUSH promises
+	Location string
 }

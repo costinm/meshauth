@@ -80,7 +80,7 @@ func main() {
 
 	// Explicit setting to enable a GCP SA.
 	projectid := os.Getenv("PROJECT_ID")
-	if projectid != "" && maCfg.AuthConfig.CloudrunIAM {
+	if projectid != "" && maCfg.AuthnConfig.CloudrunIAM {
 		// TODO: get it from MDS
 
 		// bootstrap with GCP credentials. Source of trust is a google account from file or MDS.
@@ -152,7 +152,7 @@ func main() {
 
 	varzK8SStartup.Add(ctx, int64(time.Since(t0)))
 
-	auth := meshauth.NewAuthn(maCfg.AuthConfig)
+	auth := meshauth.NewAuthn(maCfg.AuthnConfig)
 	//auth.Verify = oidc.Verify
 
 	// Setup the wrapper
@@ -215,7 +215,7 @@ func SetupCA(ctx context.Context, cfg *Config, k *k8sc.K8S) {
 			// CertManager style - ca.crt may also be present.
 			k := s["tls.key"]
 			crt := s["tls.crt"]
-			err = ca.Load(k, crt)
+			err = ca.SetCert(k, crt)
 			if err != nil {
 				slog.Info(":CA.Init", "err", err)
 			}

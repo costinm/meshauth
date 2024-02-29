@@ -27,6 +27,7 @@ import (
 // iptables -t nat -A OUTPUT -p tcp -m tcp -d 169.254.169.254 --dport 80 -j REDIRECT --to-ports 15014
 //
 // For envoy and c++ grpc - requires /etc/hosts or resolver for metadata.google.internal.
+// 169.254.169.254 metadata.google.internal.
 //
 // Alternative: use ssh-mesh or equivalent to forward to real MDS.
 func main() {

@@ -66,21 +66,12 @@ type CA struct {
 	ExtraKeyProvider func(public interface{}, id string, secret *Secret)
 }
 
-type CAConfig struct {
-	// TrustDomain to use in certs.
-	// Should not be 'cluster.local' - but a real FQDN
-	TrustDomain string
-
-	// Location of the CA root - currently a dir path.
-	//
-	RootLocation string
-
-	// TODO: additional configs/policies.
-}
-
 // NewCA creates a new CA. Keys must be loaded.
 func NewCA(cfg *CAConfig) *CA {
 	ca := &CA{Config: cfg}
+	if cfg.TrustDomain == "" {
+		cfg.TrustDomain = "cluster.local"
+	}
 	ca.prefix = "spiffe://" + cfg.TrustDomain + "/ns/"
 	return ca
 }
@@ -95,6 +86,7 @@ func NewTempCA(trust string) *CA {
 	return cao
 }
 
+// NewRoot initializes the root CA.
 func (ca *CA) NewRoot() {
 	cal := generateKey("")
 	caCert, caCertPEM := rootCert(ca.TrustDomain, "", "rootCA", ca, ca, nil)
@@ -104,44 +96,8 @@ func (ca *CA) NewRoot() {
 	ca.prefix = "spiffe://" + ca.TrustDomain + "/ns/"
 }
 
-func CAFromEnv(dir string) *CA {
-	trust := os.Getenv("TRUST_DOMAIN")
-	if trust == "" {
-		trust = "cluster.local"
-	}
-
-	ca := NewCA(&CAConfig{TrustDomain: trust, RootLocation: dir})
-
-	err := ca.load(dir)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return ca
-}
-
-// CertManager - intermediary certs have tls.key, tls.crt (std k8s)
-// plus ca.crt for the root CA. All certs issued with private CAs
-// have ca.crt - a CA cert is like any other cert.
-
-// In istio: istio-ca-secret in istio-system used to have ca-cert.pem, ca-key.pem, ca.crt
-// However new versions use tls.key, tls.crt
-const keyFile = "tls.key"
-const chainFile = "tls.crt"
-
-func (ca *CA) load(dir string) error {
-	privPEM, err := ioutil.ReadFile(filepath.Join(dir, keyFile))
-	if err != nil {
-		return err
-	}
-	certPEM, err := ioutil.ReadFile(filepath.Join(dir, chainFile))
-	if err != nil {
-		return err
-	}
-	return ca.Load(privPEM, certPEM)
-}
-
-func (ca *CA) Load(privPEM, certPEM []byte) error {
+// SetCert will Init an existing root CA from bytes.
+func (ca *CA) SetCert(privPEM, certPEM []byte) error {
 	kp, err := tls.X509KeyPair(certPEM, privPEM)
 	if err != nil {
 		return err
@@ -161,6 +117,57 @@ func (ca *CA) Load(privPEM, certPEM []byte) error {
 	return nil
 }
 
+func (ca *CA) Init(dir string) error {
+	privPEM, err := ioutil.ReadFile(filepath.Join(dir, keyFile))
+	if err != nil {
+		return err
+	}
+	certPEM, err := ioutil.ReadFile(filepath.Join(dir, chainFile))
+	if err != nil {
+		return err
+	}
+	return ca.SetCert(privPEM, certPEM)
+}
+
+
+func (ca *CA) Save(dir string) error {
+	p := MarshalPrivateKey(ca.Private)
+
+	err := ioutil.WriteFile(filepath.Join(dir, keyFile), p, 0660)
+	if err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(filepath.Join(dir, chainFile), ca.CACertPEM, 0660)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+
+func CAFromEnv(dir string) *CA {
+	trust := os.Getenv("TRUST_DOMAIN")
+
+	ca := NewCA(&CAConfig{TrustDomain: trust, RootLocation: dir})
+
+	err := ca.Init(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return ca
+}
+
+// CertManager - intermediary certs have tls.key, tls.crt (std k8s)
+// plus ca.crt for the root CA. All certs issued with private CAs
+// have ca.crt - a CA cert is like any other cert.
+
+// In istio: istio-ca-secret in istio-system used to have ca-cert.pem, ca-key.pem, ca.crt
+// However new versions use tls.key, tls.crt
+const keyFile = "tls.key"
+const chainFile = "tls.crt"
+
+// NewIntermediaryCA creates a cert for an intermediary CA.
 func (ca *CA) NewIntermediaryCA(trust, cluster string) *CA {
 	cak := generateKey("")
 
@@ -181,27 +188,13 @@ func (ca *CA) NewIntermediaryCA(trust, cluster string) *CA {
 func (ca *CA) NewID(ns, sa string, dns []string) *MeshAuth {
 	crt, kp, cp := ca.NewTLSCert(ns, sa, dns)
 
-	nodeID := NewMeshAuth(&MeshAuthCfg{})
+	nodeID := NewMeshAuth(&MeshCfg{})
 	nodeID.AddRoots(ca.CACertPEM)
 	// Will fill in trust domain, namespace, sa from the minted cert.
-	nodeID.SetCertPEM(kp, []string{string(cp)})
+	nodeID.SetCertPEM(string(kp), string(cp))
 	nodeID.SetTLSCertificate(crt)
 
 	return nodeID
-}
-
-func (ca *CA) Save(dir string) error {
-	p := MarshalPrivateKey(ca.Private)
-
-	err := ioutil.WriteFile(filepath.Join(dir, keyFile), p, 0660)
-	if err != nil {
-		return err
-	}
-	err = ioutil.WriteFile(filepath.Join(dir, chainFile), ca.CACertPEM, 0660)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 var kty = "ec266"
@@ -242,38 +235,42 @@ func (ca *CA) NewTLSCert(ns, sa string, dns []string) (*tls.Certificate, []byte,
 	return ca.newTLSCertAndKey(csr, nodeKey, ca.Private, ca.CACert)
 }
 
-func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
-	var priv crypto.PrivateKey
+//func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
+//	var priv crypto.PrivateKey
+//
+//	rsaKey := generateKey("")
+//	priv = rsaKey
+//
+//	csr := &x509.CertificateRequest{
+//		Subject: pkix.Name{
+//			Organization: []string{san},
+//		},
+//	}
+//	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
+//
+//	encodeMsg := "CERTIFICATE REQUEST"
+//
+//	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
+//
+//	var encodedKey []byte
+//	switch k := priv.(type) {
+//	case *rsa.PrivateKey:
+//		encodedKey = x509.MarshalPKCS1PrivateKey(k)
+//		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
+//	case *ecdsa.PrivateKey:
+//		encodedKey, err = x509.MarshalECPrivateKey(k)
+//		if err != nil {
+//			return nil, nil, err
+//		}
+//		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+//	}
+//
+//	return
+//}
 
-	rsaKey := generateKey("")
-	priv = rsaKey
-
-	csr := GenCSRTemplate(a.Domain, san)
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
-
-	encodeMsg := "CERTIFICATE REQUEST"
-
-	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
-
-	var encodedKey []byte
-	switch k := priv.(type) {
-	case *rsa.PrivateKey:
-		encodedKey = x509.MarshalPKCS1PrivateKey(k)
-		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
-	case *ecdsa.PrivateKey:
-		encodedKey, err = x509.MarshalECPrivateKey(k)
-		if err != nil {
-			return nil, nil, err
-		}
-		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
-	}
-
-	return
-}
-
-// SignCertDER uses caPrivate to sign a cert, returns the DER format.
+// signCertDER uses caPrivate to sign a cert, returns the DER format.
 // Used primarily for tests with self-signed cert.
-func SignCertDER(template *x509.Certificate, pub crypto.PublicKey, caPrivate crypto.PrivateKey, parent *x509.Certificate) ([]byte, error) {
+func signCertDER(template *x509.Certificate, pub crypto.PublicKey, caPrivate crypto.PrivateKey, parent *x509.Certificate) ([]byte, error) {
 	certDER, err := x509.CreateCertificate(rand.Reader, template, parent, pub, caPrivate)
 	if err != nil {
 		return nil, err
@@ -295,17 +292,6 @@ func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
 	return nil
 }
 
-func GenCSRTemplate(trustDomain, san string) *x509.CertificateRequest {
-	template := &x509.CertificateRequest{
-		Subject: pkix.Name{
-			Organization: []string{trustDomain},
-		},
-	}
-
-	// TODO: add the SAN, it is not required, server will fill up
-
-	return template
-}
 
 func (a *CA) GetToken(ctx context.Context, aud string) (string, error) {
 	jwt := &JWT{
@@ -434,7 +420,7 @@ func rootCert(org, ou, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey, 
 
 func (c *CA) newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*tls.Certificate, []byte, []byte) {
 	pub := PublicKey(priv)
-	certDER, err := SignCertDER(template, pub, ca, parent)
+	certDER, err := signCertDER(template, pub, ca, parent)
 	if err != nil {
 		return nil, nil, nil
 	}

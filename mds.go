@@ -214,7 +214,7 @@ func (m *MDS) MetadataGet(path string) (string, error) {
 // - the env variable is set
 // - a probe to the IP and URL / returns the proper flavor.
 // - DNS resolves metadata.google.internal to the IP
-func (m *MDS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (m *MDS) HandleMDS(w http.ResponseWriter, r *http.Request) {
 	flavor := r.Header.Get("Metadata-Flavor")
 
 	if flavor == "" && r.RequestURI != "/" {
@@ -295,10 +295,10 @@ func (m *MDS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.RequestURI {
 	case projIDPath:
 		w.WriteHeader(200)
-		fmt.Fprintf(w, "%s", m.MeshAuth.MeshAuthCfg.MDS.Project.ProjectId)
+		fmt.Fprintf(w, "%s", m.MeshAuth.MeshCfg.MDS.Project.ProjectId)
 	case projNumberPath:
 		w.WriteHeader(200)
-		fmt.Fprintf(w, "%d", m.MeshAuth.MeshAuthCfg.MDS.Project.NumericProjectId)
+		fmt.Fprintf(w, "%d", m.MeshAuth.MeshCfg.MDS.Project.NumericProjectId)
 	case "machine-type":
 		w.WriteHeader(200)
 		fmt.Fprintf(w, "%s", "dev")

@@ -24,7 +24,7 @@ func TestCerts(t *testing.T) {
 		cai.Save(base + "testdata/cluster1")
 	})
 
-	// Load the test CAs
+	// SetCert the test CAs
 	ca := CAFromEnv("testdata/ca")
 
 	cai := CAFromEnv("testdata/cluster1")
@@ -41,23 +41,23 @@ func TestCerts(t *testing.T) {
 	})
 
 	// Both alice and bob have the same root CA
-	alice, _ := FromEnv(&MeshAuthCfg{
+	alice, _ := FromEnv(&MeshCfg{
 		CertDir: "testdata/alice",
 		Domain:  "test.mesh.local",
 	})
 
-	bob, _ := FromEnv(&MeshAuthCfg{
+	bob, _ := FromEnv(&MeshCfg{
 		AllowedNamespaces: []string{"alicens"},
 		CertDir:           "testdata/bob",
 		Domain:            "test.mesh.local", // bug - fix cert generation for intermdiate
 	})
 
 	// Self-signed certificate, no CA, chain has 1 element.
-	aliceExt := NewMeshAuth(&MeshAuthCfg{})
+	aliceExt := NewMeshAuth(&MeshCfg{})
 	aliceExt.InitSelfSigned("")
 
 	// Self-signed cert, no CA roots to verify clients
-	bobExt := NewMeshAuth(&MeshAuthCfg{})
+	bobExt := NewMeshAuth(&MeshCfg{})
 	bobExt.InitSelfSigned("")
 
 	//log.Println("Alice: ", alice.TrustDomain, alice)

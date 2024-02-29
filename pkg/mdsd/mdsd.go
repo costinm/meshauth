@@ -121,10 +121,10 @@ func (m *MDSD) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.RequestURI {
 	case projIDPath:
 		w.WriteHeader(200)
-		fmt.Fprintf(w, "%s", m.MeshAuth.MeshAuthCfg.MDS.Project.ProjectId)
+		fmt.Fprintf(w, "%s", m.MeshAuth.MeshCfg.MDS.Project.ProjectId)
 	case projNumberPath:
 		w.WriteHeader(200)
-		fmt.Fprintf(w, "%d", m.MeshAuth.MeshAuthCfg.MDS.Project.NumericProjectId)
+		fmt.Fprintf(w, "%d", m.MeshAuth.MeshCfg.MDS.Project.NumericProjectId)
 	case "machine-type":
 		w.WriteHeader(200)
 		fmt.Fprintf(w, "%s", "dev")

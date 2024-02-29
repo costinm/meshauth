@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,27 +28,30 @@ var (
 	defaultAuth *MeshAuth
 )
 
-// MeshAuthCfg is used to configure the mesh authentication.
+// MeshCfg is used to configure the mesh basic settings related to security.
 //
-//
-type MeshAuthCfg struct {
+// It includes definition of listeners and cluters (dst) - with associated keys/certs.
+// This package does not provide any protocol or listening.
+type MeshCfg struct {
 
-	// AuthConfig defines the trust config for the node - the list of signers that are trusted for specific
+	// AuthnConfig defines the trust config for the node - the list of signers that are trusted for specific
 	// issuers and domains, audiences, etc.
 	//
 	// Based on Istio jwtRules, but generalized to all signer types.
 	//
 	// Authz is separated - this only defines who do we trust (and policies on what we trust it for)
-	AuthConfig `json:",inline"`
+	//
+	// Destinations and listeners may have their own AuthnConfig - this is the default.
+	AuthnConfig `json:",inline"`
 
-	// Will attempt to load/reload certificates from this directory.
+	// Will attempt to Init/reload certificates from this directory.
 	// If empty, FromEnv will auto-detect.
 	// For mounted secret of type kubernetes.io/tls, the keys are tls.key, tls.crt
 	// Deprecated - Credential
 	CertDir string `json:"certDir,omitempty"`
 
 	// Trusted roots, in DER format.
-	// Deprecated - AuthConfig
+	// Deprecated - AuthnConfig
 	RootCertificates [][]byte `json:"roots,omitempty"`
 
 	// Domain is extracted from the cert or set by user, used to verify
@@ -77,29 +81,20 @@ type MeshAuthCfg struct {
 	// If no authz rule is set, 'same namespace' and 'istio-system' are allowed.
 	Authz []*AuthzRule
 
-	// A Credential named 'default' will be created if not explicitly specified, to identify the current workload.
-	//
-	Credentials []*Credential `json:"credentials,omitempty"`
+	// Private key. UGate primary key is EC256, in PEM format.
+	// Used for client and server auth for all protocols.
+	// If not set, will be loaded from CertDir tls.key file, or auto-generated.
+	Priv string `json:"priv,omitempty"`
 
-	// Private key to use in both server and client authentication.
-	// EC256: DER
-	// ED22519: 32B
-	// RSA: DER
-	// Deprecated - Credentials
-	Priv []byte `json:"priv,omitempty"`
+	// PEM certificate chain
+	CertBytes string `json:"cert,omitempty"`
 
 	// DER public key
-	// Deprecated - Credentials
 	PublicKey []byte `json:"pub,omitempty"`
 
-	// DER certificate chain
-	// Deprecated - Credentials
-	CertBytes []byte `json:"cert,omitempty"`
 
 	// EC256 key, in base64 format. Used for self-signed identity and webpush.
-	// Deprecated - Credentials
 	EC256Key string
-	// Deprecated - Credentials
 	EC256Pub string
 
 	ec256Priv []byte `json:-`
@@ -133,22 +128,23 @@ type MeshAuthCfg struct {
 	Listeners map[string]*PortListener `json:"listeners,omitempty"`
 }
 
-func NewMeshAuthCfg() MeshAuthCfg{
-	return MeshAuthCfg{
+func NewMeshAuthCfg() MeshCfg {
+	return MeshCfg{
 		Dst: map[string]*Dest{},
 		Listeners: map[string]*PortListener{},
 
 	}
 }
 
-// Credential identifies a source of client private info to use for authentication.
+// Credential identifies a source of client private info to use for authentication
+// with a destination.
 //
 // It can be a shared secret (token), private key, etc.
 type Credential struct {
 	// Identity asserted by this credential - if not set inferred from JWT/cert
 	Principal string
 
-	// Load the cert credential from this directory (or URL)
+	// SetCert the cert credential from this directory (or URL)
 	// The 'default' credential will use well-known locations.
 	// All other certs are either explicit or relative to CertDir/NAME
 	CertLocation string
@@ -191,23 +187,25 @@ type AuthzRule struct {
 	AllowedNamespaces []string
 }
 
-// AuthConfig specifies trusted sources for incoming authentication.
+// AuthnConfig specifies trusted sources for incoming authentication.
 //
 // Common case is as a global config, but may be specified per listener.
 //
 // Unlike Istio, this also covers SSH and Cert public keys - treating all signed mechanisms the same.
 //
-type AuthConfig struct {
+type AuthnConfig struct {
 	// Trusted issuers for auth.
 	//
 	Issuers []*TrustConfig `json:"trust,omitempty"`
 
+	// If set, accept truncated tokens.
+	// TODO: restrict to the main h2 listener, auto-set based on env.
 	CloudrunIAM bool `json:"cloudruniam,omitempty"`
 
 	// Top level audiences. The rule may have a custom audience as well, if it matches this is
 	// ignored.
 	// If empty, the hostname is used as a default.
-	Audiences []string `json:"audiences,omitempty"`
+	Audiences []string `json:"aud,omitempty"`
 }
 
 // Configure the settings for one trusted identity provider. This is primarily used for server side authenticating
@@ -217,11 +215,14 @@ type AuthConfig struct {
 type TrustConfig struct {
 
 	// Example: https://foobar.auth0.com
-	// Example: 1234567-compute@developer.gserviceaccount.com
-	// In GKE, iss: format is https://container.googleapis.com/v1/projects/$PROJECT/locations/$LOCATION/clusters/$CLUSTER
-	// and the discovery doc is relative (i.e. standard). The keys are
-	// $ISS/jwks
-	Issuer string `protobuf:"bytes,1,opt,name=issuer,proto3" json:"issuer,omitempty"`
+	// Example: 1234567-compute@developer.gserviceaccount.com (for tokens signed by a GSA)
+	// In GKE, format is https://container.googleapis.com/v1/projects/$PROJECT/locations/$LOCATION/clusters/$CLUSTER
+	// and the discovery doc is relative (i.e. standard).
+	// The keys typically are $ISS/jwks - but OIDC document should be loaded.
+	//
+	// Must match the Issuer in the JWT token.
+	// As 'converged' auth, this is also used to represent SSH or TLS CAs.
+	Issuer string `json:"issuer,omitempty"`
 
 	// Delegation indicates a mechanism of delegation - can be:
 	// - TODO: a URL indicating a different issuer that is replacing the signature.
@@ -229,11 +230,11 @@ type TrustConfig struct {
 	// the JWT is verified by a frontend and replaced with a token without signature.
 	// - header:NAME - the jwt is decoded and placed in a header.
 	// - xfcc -
-	Delegation string
+	//Delegation string
 
 	// Identification for the frontend that has validated the identity
 	//
-	Delegator string
+	//Delegator string
 
 	// The list of JWT
 	// [audiences](https://tools.ietf.org/html/rfc7519#section-4.1.3).
@@ -249,7 +250,9 @@ type TrustConfig struct {
 	// - bookstore_android.apps.example.com
 	//   bookstore_web.apps.example.com
 	// ```
-	Audiences []string `protobuf:"bytes,2,rep,name=audiences,proto3" json:"audiences,omitempty"`
+	// Istio had this next to issuer - in meshauth it is one level higher, all
+	// issuers can use the same aud ( it is based on hostname of the node or service )
+	//Audiences []string `protobuf:"bytes,2,rep,name=audiences,proto3" json:"audiences,omitempty"`
 
 	// URL of the provider's public key set to validate signature of the
 	// JWT. See [OpenID Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata).
@@ -264,7 +267,7 @@ type TrustConfig struct {
 	//
 	//
 	// Note: Only one of jwks_uri and jwks should be used. jwks_uri will be ignored if it does.
-	JwksUri string `protobuf:"bytes,3,opt,name=jwks_uri,json=jwksUri,proto3" json:"jwks_uri,omitempty"`
+	JwksUri string `json:"jwks_uri,omitempty"`
 
 	// JSON Web Key Set of public keys to validate signature of the JWT.
 	// See https://auth0.com/docs/jwks.
@@ -289,7 +292,7 @@ type TrustConfig struct {
 	//   fromParams:
 	//   - "my_token"
 	// ```
-	FromParams []string `protobuf:"bytes,7,rep,name=from_params,json=fromParams,proto3" json:"from_params,omitempty"`
+	//FromParams []string `protobuf:"bytes,7,rep,name=from_params,json=fromParams,proto3" json:"from_params,omitempty"`
 
 	// This field specifies the header name to output a successfully verified JWT payload to the
 	// backend. The forwarded data is `base64_encoded(jwt_payload_in_JSON)`. If it is not specified,
@@ -297,7 +300,7 @@ type TrustConfig struct {
 	// OutputPayloadToHeader string `protobuf:"bytes,8,opt,name=output_payload_to_header,json=outputPayloadToHeader,proto3" json:"output_payload_to_header,omitempty"`
 
 	// If set to true, the orginal token will be kept for the ustream request. Default is false.
-	ForwardOriginalToken bool `protobuf:"varint,9,opt,name=forward_original_token,json=forwardOriginalToken,proto3" json:"forward_original_token,omitempty"`
+	//ForwardOriginalToken bool `protobuf:"varint,9,opt,name=forward_original_token,json=forwardOriginalToken,proto3" json:"forward_original_token,omitempty"`
 
 	// PEM provides the set of public keys or certificates in-line.
 	//
@@ -306,19 +309,19 @@ type TrustConfig struct {
 	// Extension to Istio JwtRule - specify the public key as PEM. This may include multiple
 	// public keys or certificates. This will be populated by a mutating webhook and updated
 	// by a job.
-	PEM string `protobuf:"bytes,11,opt,name=pem,proto3" json:"pem,omitempty"`
+	PEM string `json:"pem,omitempty"`
 
 	// Location of a PEM file providing the public keys or certificates of the trusted source.
 	// Directory or URL. If provided, will be reloaded periodically or based on expiration time.
-	PEMLocation string `protobuf:"bytes,13,opt,name=pem_location,proto3" json:"pem_location,omitempty"`
+	PEMLocation string `json:"pem_location,omitempty"`
 
 	// Extension to Isio JwtRule - cached subset of the OIDC discovery document
-	OIDC *OIDCDiscDoc `protobuf:"bytes,12,opt,name=pem,proto3" json:"oidc,omitempty"`
+	OIDC *OIDCDiscDoc `json:"oidc,omitempty"`
 
 	// Not stored - the actual keys or verifiers for this issuer.
 	Key interface{} `json:-"`
 
-	// KeysById is populated from the Jwks config
+	// KeysById is populated from the Jwks config or PEM
 	KeysByKid map[string]interface{} `json:-`
 
 	m         sync.Mutex `json:-`
@@ -379,22 +382,36 @@ func (l *PortListener) Addr() net.Addr {
 	return l.NetListener.Addr()
 }
 
+func (l *PortListener) GetPort() int32 {
+	if l.Port != 0 {
+		return l.Port
+	}
+	_, p, _ := net.SplitHostPort(l.Address)
+	pp, _ := strconv.Atoi(p)
+	l.Port = int32(pp)
+	return l.Port
+}
+
 // MeshAuth represents a workload identity and associated info required for minimal
 // mesh-compatible security. Includes helpers for authentication and basic provisioning.
 //
-// By default it will attempt to load a workload cert, and extract info from the cert.
+// By default it will attempt to Init a workload cert, and extract info from the cert.
 //
 // A workload may be associated with multiple service accounts and identity providers, and
 // may have multiple certificates.
 type MeshAuth struct {
-	*MeshAuthCfg
+	*MeshCfg
 
-	// Transport is a function that returns a round tripper for the destination.
-	// Used to avoid direct dep to H2 library.
-	Transport func(*Dest) http.RoundTripper
-
-	// Primary certificate and private key. Loaded or generated.
+	// Primary workload ID TLS certificate and private key. Loaded or generated.
+	// Default is to use EC256 certs. The private key can be used to sign JWTs.
+	// The public key and sha can be used as a node identity.
 	Cert *tls.Certificate
+
+	// cached PublicKeyBase64 encoding of the public key, for EC256 VAPID.
+	PublicKeyBase64 string
+
+	// Public key as base32 SHA (52 bytes)
+	PubID           string
 
 	// Trusted roots - used for verification. RawSubject is used as key - Subjects() return the DER list.
 	// This is 'write only', used as a cache in verification.
@@ -405,14 +422,9 @@ type MeshAuth struct {
 	trustedCertPool *x509.CertPool
 	meshCertPool    *x509.CertPool
 
-	// cached PublicKeyBase64 encoding of the public key, for EC256 VAPID.
-	// Set by setEC256Vapid,
-	PublicKeyBase64 string
-	PubID           string
 
-	// Node ID - derived from the public key if not set explicitly as base32 encoding
-	// of the pub64. May also be the pod ID, hostname. The DNS system or discovery should
-	// be able to use it as a key and return IPs.
+	// Node ID - pod ID, CloudRun instanceID, hostname.
+	//
 	// Must be DNS compatible, case insensitive, max 63
 	ID string `json:"id,omitempty"`
 
@@ -425,14 +437,16 @@ type MeshAuth struct {
 	// Explicit certificates (lego), key is hostname from file
 	//
 	CertMap map[string]*tls.Certificate
+
 	// GetCertificateHook allows plugging in an alternative certificate provider.
 	GetCertificateHook func(host string) (*tls.Certificate, error)
 
 	// Auth token providers
 	AuthProviders map[string]TokenSource
 
-	// Metadata about this node.
+	// Metadata about this node. Also, the default TokenSource.
 	MDS                *MDS
+
 	ClientSessionCache tls.ClientSessionCache
 
 	Stop chan struct{}
@@ -492,15 +506,15 @@ type PerRPCCredentials interface {
 // NewMeshAuth initializes the auth systems based on config.
 //
 // Must call SetTLSCertificate to initialize or one of the methods that finds or generates the primary identity.
-func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
+func NewMeshAuth(cfg *MeshCfg) *MeshAuth {
 	if cfg == nil {
-		cfg = &MeshAuthCfg{}
+		cfg = &MeshCfg{}
 	}
 	if cfg.Dst == nil {
 		cfg.Dst = map[string]*Dest{}
 	}
 	a := &MeshAuth{
-		MeshAuthCfg:   cfg,
+		MeshCfg:       cfg,
 		CertMap:       map[string]*tls.Certificate{},
 		meshCertPool:  x509.NewCertPool(),
 		MDS:           &MDS{},
@@ -525,10 +539,22 @@ func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 		a.setEC256Vapid()
 	}
 
-	return a
+	if cfg.Priv != "" && cfg.CertBytes != "" {
+		a.SetCertPEM(cfg.Priv, cfg.CertBytes)
+	}
+
+	if a.CertDir != "" {
+		c, cb, err := loadCertFromDir(a.CertDir)
+		if err == nil {
+			a.SetTLSCertificate(c)
+		}
+		a.CertBytes = string(cb)
+	}
+
+		return a
 }
 
-// FromEnv will attempt to identify and load the certificates.
+// FromEnv will attempt to identify and Init the certificates.
 // This should be called from main() and for normal app use.
 //
 // NewMeshAuth can be used in tests or for fine control over
@@ -544,20 +570,22 @@ func NewMeshAuth(cfg *MeshAuthCfg) *MeshAuth {
 //
 // If a cert is not found, Cert field will be nil, and the app should
 // use one of the methods of getting a cert or call InitSelfSigned.
-func FromEnv(cfg *MeshAuthCfg) (*MeshAuth, error) {
+func FromEnv(cfg *MeshCfg) (*MeshAuth, error) {
 	a := NewMeshAuth(cfg)
 
 	// If running in K8S - and the pod config doesn't prevent access to K8S -
 	// detect and configure a KUBERNETES cluster and set self info from K8S env.
 	a.inCluster()
 
-	cfg = a.MeshAuthCfg
+	cfg = a.MeshCfg
 	// Attempt to locate existing workload certs from the cert dir.
 	// TODO: attempt to get certs from an agent.
 	if cfg.CertDir == "" {
 		// Try to find the certificate directory
 		if _, err := os.Stat(filepath.Join("./", "key.pem")); !os.IsNotExist(err) {
 			a.CertDir = "./"
+		} else if _, err := os.Stat(filepath.Join("./", "tls.key")); !os.IsNotExist(err) {
+				a.CertDir = "./"
 		} else if _, err := os.Stat(filepath.Join(workloadCertDir, privateKey)); !os.IsNotExist(err) {
 			a.CertDir = workloadCertDir
 		} else if _, err := os.Stat(filepath.Join(legacyCertDir, "key.pem")); !os.IsNotExist(err) {
@@ -614,22 +642,6 @@ func (ma *MeshAuth) inCluster() *Dest {
 	ma.Dst["KUBERNETES"] = c
 
 	return c
-}
-
-// HttpClient returns a http.Client configured based on the security settings for Dest.
-func (auth *MeshAuth) HttpClient(d *Dest) *http.Client {
-	return &http.Client{
-		Transport: auth.RoundTripper(d),
-	}
-}
-
-// RoundTripper returns a http.RoundTripper configured based on a Dest.
-func (auth *MeshAuth) RoundTripper(d *Dest) http.RoundTripper {
-	if auth.Transport == nil {
-		return http.DefaultClient.Transport
-	}
-	// Default transport
-	return auth.Transport(d)
 }
 
 // ------------ Helpers around TokenSource
