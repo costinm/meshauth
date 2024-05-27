@@ -58,7 +58,7 @@ type MeshCfg struct {
 	// peer certificates. If not set, will be populated when cert is loaded.
 	// Should be a real domain with OIDC keys or platform specific.
 	// NOT cluster.local
-	Domain    string `json:"domain,omitempty"`
+	Domain string `json:"domain,omitempty"`
 
 	DomainAliases []string `json:"domainAliases,omitempty"`
 
@@ -92,13 +92,13 @@ type MeshCfg struct {
 	// DER public key
 	PublicKey []byte `json:"pub,omitempty"`
 
-
 	// EC256 key, in base64 format. Used for self-signed identity and webpush.
 	EC256Key string
 	EC256Pub string
 
 	ec256Priv []byte `json:-`
 
+	// MDS is the serialized recursive metadata - also stored as file or cached.
 	MDS *util.Metadata `json:"mds,omitempty"`
 
 	// TokenProvider is a URL used to get access tokens, as a GCP-like MDS server,
@@ -108,7 +108,11 @@ type MeshCfg struct {
 	// For local dev and debugging it can be replaced.
 	// It can also be a full http:// or https:// URL.
 	// Deprecated - Credentials
-	TokenProvider    string `json:"token_source,omitempty"`
+	TokenProvider string `json:"token_source,omitempty"`
+
+	// MeshAddr is a URL or string representing the primary (bootstrap) address
+	// for the mesh - can be a K8S cluster, XDS server, file.
+	MeshAddr string `json:"meshAddr,omitempty"`
 
 	// Dst contains pre-configured or discovered properties for destination services.
 	// When running in K8S, "KUBERNETES" is set with the in-cluster config.
@@ -130,9 +134,8 @@ type MeshCfg struct {
 
 func NewMeshAuthCfg() MeshCfg {
 	return MeshCfg{
-		Dst: map[string]*Dest{},
+		Dst:       map[string]*Dest{},
 		Listeners: map[string]*PortListener{},
-
 	}
 }
 
@@ -192,7 +195,6 @@ type AuthzRule struct {
 // Common case is as a global config, but may be specified per listener.
 //
 // Unlike Istio, this also covers SSH and Cert public keys - treating all signed mechanisms the same.
-//
 type AuthnConfig struct {
 	// Trusted issuers for auth.
 	//
@@ -411,7 +413,7 @@ type MeshAuth struct {
 	PublicKeyBase64 string
 
 	// Public key as base32 SHA (52 bytes)
-	PubID           string
+	PubID string
 
 	// Trusted roots - used for verification. RawSubject is used as key - Subjects() return the DER list.
 	// This is 'write only', used as a cache in verification.
@@ -421,7 +423,6 @@ type MeshAuth struct {
 	// This can also be done by krun - loading a config map with same info.
 	trustedCertPool *x509.CertPool
 	meshCertPool    *x509.CertPool
-
 
 	// Node ID - pod ID, CloudRun instanceID, hostname.
 	//
@@ -441,11 +442,19 @@ type MeshAuth struct {
 	// GetCertificateHook allows plugging in an alternative certificate provider.
 	GetCertificateHook func(host string) (*tls.Certificate, error)
 
-	// Auth token providers
+	// AuthProviders - matching kubeconfig user.authProvider.name
+	// It is expected to return tokens with the given audience - in case of GCP
+	// returns access tokens. If not set the cluster can't be created.
+	//
+	// A number of pre-defined token sources are used:
+	// - gcp - returns GCP access tokens using MDS or default credentials. Used for example by GKE clusters.
+	// - k8s - return K8S WorkloadID tokens with the given audience for default K8S cluster.
+	// - istio-ca - returns K8S tokens with istio-ca audience - used by Citadel and default Istiod
+	// - sts - federated google access tokens associated with GCP identity pools.
 	AuthProviders map[string]TokenSource
 
 	// Metadata about this node. Also, the default TokenSource.
-	MDS                *MDS
+	MDS *MDS
 
 	ClientSessionCache tls.ClientSessionCache
 
@@ -551,7 +560,7 @@ func NewMeshAuth(cfg *MeshCfg) *MeshAuth {
 		a.CertBytes = string(cb)
 	}
 
-		return a
+	return a
 }
 
 // FromEnv will attempt to identify and Init the certificates.
@@ -585,7 +594,7 @@ func FromEnv(cfg *MeshCfg) (*MeshAuth, error) {
 		if _, err := os.Stat(filepath.Join("./", "key.pem")); !os.IsNotExist(err) {
 			a.CertDir = "./"
 		} else if _, err := os.Stat(filepath.Join("./", "tls.key")); !os.IsNotExist(err) {
-				a.CertDir = "./"
+			a.CertDir = "./"
 		} else if _, err := os.Stat(filepath.Join(workloadCertDir, privateKey)); !os.IsNotExist(err) {
 			a.CertDir = workloadCertDir
 		} else if _, err := os.Stat(filepath.Join(legacyCertDir, "key.pem")); !os.IsNotExist(err) {

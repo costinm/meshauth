@@ -23,29 +23,35 @@ GIT_REPO?=${REPO}
 # Skaffold can pass this
 # When running pods, label skaffold.dev/run-id is set and used for log watching
 IMAGE_TAG?=latest
+export IMAGE_TAG
 
-DOCKER_REPO?=ghcr.io/costinm/${GIT_REPO}
+# ghcr.io - easiest to login from github actions. Doesn't seem to work in cloudrun
+#DOCKER_REPO?=ghcr.io/costinm/${GIT_REPO}
+DOCKER_REPO?=costinm
+
 
 BASE_DISTROLESS?=gcr.io/distroless/static
-BASE_IMAGE?=debian:testing-slim
+#BASE_IMAGE?=debian:testing-slim
 
-IMAGE_REPO?=${DOCKER_REPO}/${BIN}
-
+# Does not include the TLS keys !
+#BASE_IMAGE?=debian:testing-slim
+# Alpine based, full of debug tools.
+BASE_IMAGE?=nicolaka/netshoot
 
 export PATH:=$(PATH):${HOME}/go/bin
 
 echo:
-	env
 	@echo BASE: ${BASE}
 	@echo SRC_DIR: ${SRC_DIR}
-	@echo TOP: ${TOP}
 	@echo OUT: ${OUT}
 	@echo DOCKER_REPO: ${DOCKER_REPO}
-	@echo BASE_DISTROLESS: ${BASE_DISTROLESS}
+	@echo BASE_IMAGE: ${BASE_IMAGE}
 	@echo REPO: ${REPO}
 	@echo MAKEFILE_LIST: $(MAKEFILE_LIST)
+	@echo BIN: ${BIN}
 
 	# From skaffold or default
+	@echo IMAGE: ${IMAGE}
 	@echo IMAGE_TAG: ${IMAGE_TAG}
 	@echo IMAGE_REPO: ${IMAGE_REPO}
 	@echo PUSH_IMAGE: ${PUSH_IMAGE}
@@ -77,21 +83,47 @@ echo:
 # 2. Send it as DOCKER_REPO/BIN:latest - using BASE_IMAGE as base
 # 3. Save the SHA-based result as IMG
 # 4. Set /BIN as entrypoint and tag again
+#
+# Makefile magic: ":=" is evaluated once when the rule is read, so we can't use it here
+# With "=" it's evaluate multiple times if used as in push3
+# Turns out the simplest solution is to just use temp files.
+.ONESHELL:
+_push: BIN?=${REPO}
+_push: IMAGE_REPO?=${DOCKER_REPO}/${BIN}
 _push: IMAGE?=${IMAGE_REPO}:${IMAGE_TAG}
-_push:
-	@echo Building: ${IMAGE}
-	(export IMG=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
-    					  gcrane append -f - -b ${BASE_IMAGE} \
-					 			-t ${IMAGE}  \
-    					   ) && \
-    	gcrane mutate $${IMG} -t ${IMAGE_REPO}:latest -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}" --entrypoint /${BIN} 2>/dev/null && \
-    	gcrane mutate $${IMG} -t ${IMAGE} -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}" --entrypoint /${BIN} 2>/dev/null \
-    	)
+_push: echo
+	mkdir -p ${OUT}/etc/ssl/certs/
+	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
+	# Push an image and save the tag in .image1.${BIN}
+	cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
+       -b ${BASE_IMAGE} \
+       -t ${IMAGE} > ${OUT}/.image1.${BIN}
 
-# Last gcrane command should produce the image sha ?
+	echo $(shell cat ${OUT}/.image1.${BIN}) $(shell echo ${OUT}/.image1.${BIN})
 
-#    	gcrane mutate ${IMAGE} -t ${IMAGE_REPO}:latest \
+	gcrane mutate `cat ${OUT}/.image1.${BIN}` -t ${IMAGE} --entrypoint /usr/local/bin/${BIN} > ${OUT}/.image
 
+#_push3: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+#_push3: IMG1=$(shell cd ${OUT} && tar -cf - ${PUSH_FILES} usr/local/bin/${BIN} etc/ssl/certs | gcrane append -f - \
+#       -b ${BASE_IMAGE} -t ${IMAGE} )
+#_push3: IMG=$(shell gcrane mutate ${IMG1} -t ${IMAGE} --entrypoint /usr/local/bin/${BIN} )
+#_push3:
+#	@echo ${IMG} > ${OUT}/.image
+
+#
+#_push2: IMAGE?=${DOCKER_REPO}/${DOCKER_IMAGE}:${IMAGE_TAG}
+#_push2:
+#	echo ${IMAGE}
+#	(export IMG=$(shell cd ${OUT} && \
+#        tar -cf - ${PUSH_FILES} ${BIN} etc/ssl/certs | \
+#    	   gcrane append -f - -b ${BASE_IMAGE} \
+#					 		  -t ${IMAGE} \
+#    					   ) && \
+#    	gcrane mutate $${IMG} -t ${IMAGE} \
+#    	  --entrypoint /usr/local/bin/${BIN} \
+#    	)
+
+# TODO: add labels like    	  -l org.opencontainers.image.source="https://github.com/costinm/${GIT_REPO}"
 
 # To create a second image with a different base without uploading the tar again:
 #	gcrane rebase --rebased ${DOCKER_REPO}/gate:latest \
@@ -100,31 +132,59 @@ _push:
 #	   --new_base ${BASE_DEBUG} \
 
 _oci_base:
-	gcrane mutate ${OCI_BASE} -t ${IMAGE_REPO}:base --entrypoint /${BIN}
+	gcrane mutate ${OCI_BASE} -t ${DOCKER_REPO}/${BIN}:base --entrypoint /${BIN}
 
 _oci_image:
 	(cd ${OUT} && tar -cf - ${PUSH_FILES} ${BIN} | \
     	gcrane append -f - \
-    				  -b  ${IMAGE_REPO}:base \
-    				  -t ${IMAGE_REPO}:${IMAGE_TAG} )
+    				  -b  ${DOCKER_REPO}/${BIN}:base \
+    				  -t ${DOCKER_REPO}/${BIN}:${IMAGE_TAG} )
 
 _oci_local: build
 	docker build -t costinm/hbone:${IMAGE_TAG} -f tools/Dockerfile ${OUT}/
 
 
-.go-build:
-	(cd cmd/${NAME} && go build -o ${OUT}/${NAME} .)
-
 deps:
 	go install github.com/google/go-containerregistry/cmd/gcrane@latest
 
-_cloudrun:
-	gcloud alpha run services replace ${MANIFEST} \
-		  --platform managed --project ${PROJECT_ID} --region ${REGION}
+# Build a command under cmd/BIN, placing it in $OUT/usr/local/bin/$BIN
+#
+# Also copies ssl certs
+#
+# Params:
+# - BIN
+#
+# Expects go.mod in cmd/ or cmd/BIN directory.
+_build: BIN?=${REPO}
+_build: DIR?=cmd/${BIN}
+_build:
+	@echo GOSTATIC: ${BASE}/${DIR} -> ${OUT}/usr/local/bin/${BIN}
+	mkdir -p ${OUT}/etc/ssl/certs/
+	cp /etc/ssl/certs/ca-certificates.crt ${OUT}/etc/ssl/certs/
+	mkdir -p ${OUT}/usr/local/bin
+	cd cmd/${BIN} && ${GOSTATIC} -o ${OUT}/usr/local/bin/${BIN} .
 
-_deps_cloudrun:
-	gcloud components install --quiet \
-        alpha \
-        beta \
-        log-streaming \
-        cloud-run-proxy
+
+_buildcgo: DIR?=cmd/${BIN}
+_buildcgo:
+	@echo CGO: ${BASE}/${DIR} -> ${OUT}/usr/local/bin/${BIN}
+	mkdir -p ${OUT}/usr/local/bin
+	cd ${DIR} &&  CC=musl-gcc go build -gcflags='all=-N -l'  --ldflags '-linkmode external -extldflags "-static"' \
+	   -tags ${GO_TAGS} -o ${OUT}/usr/local/bin/${BIN} .
+	#cd ${DIR} &&  go build -a -gcflags='all=-N -l' -ldflags '-extldflags "-static"' \
+ 	#   -tags ${GO_TAGS} -o ${OUT}/usr/local/bin/${BIN} .
+
+_buildglibc: DIR?=cmd/${BIN}
+_buildglibc:
+	@echo CGO: ${BASE}/${DIR} -> ${OUT}/usr/local/bin/${BIN}
+	mkdir -p ${OUT}/usr/local/bin
+	cd ${DIR} &&  go build -a -gcflags='all=-N -l' -ldflags '-extldflags "-static"' \
+ 	   -tags ${GO_TAGS} -o ${OUT}/usr/local/bin/${BIN} .
+
+# https://honnef.co/articles/statically-compiled-go-programs-always-even-with-cgo-using-musl/
+# apt install musl musl-tools musl-dev
+
+# Sizes (example for ugate):
+# static - 65M
+# cgo - 103M (83M stripped)
+# musl - 102M (82M stripped)

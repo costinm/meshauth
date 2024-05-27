@@ -1,6 +1,6 @@
 module github.com/costinm/meshauth/pkg/oidc
 
-go 1.20
+go 1.21
 
 replace github.com/costinm/meshauth => ../../
 

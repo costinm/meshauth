@@ -32,6 +32,18 @@ const (
 	blockTypeCertificate     = "CERTIFICATE"
 )
 
+type CAConfig struct {
+	// TrustDomain to use in certs.
+	// Should not be 'cluster.local' - but a real FQDN
+	TrustDomain string
+
+	// Location of the CA root - currently a dir path.
+	//
+	RootLocation string
+
+	// TODO: additional configs/policies.
+}
+
 // CA is used as an internal CA, mainly for testing and provisioning.
 // Roughly equivalent with a simplified Istio Citadel.
 //
@@ -89,7 +101,7 @@ func NewTempCA(trust string) *CA {
 // NewRoot initializes the root CA.
 func (ca *CA) NewRoot() {
 	cal := generateKey("")
-	caCert, caCertPEM := rootCert(ca.TrustDomain, "", "rootCA", ca, ca, nil)
+	caCert, caCertPEM := rootCert(ca.TrustDomain, "", "rootCA", cal, cal, nil)
 	ca.Private = cal
 	ca.CACert = caCert
 	ca.CACertPEM = caCertPEM
@@ -129,7 +141,6 @@ func (ca *CA) Init(dir string) error {
 	return ca.SetCert(privPEM, certPEM)
 }
 
-
 func (ca *CA) Save(dir string) error {
 	p := MarshalPrivateKey(ca.Private)
 
@@ -143,7 +154,6 @@ func (ca *CA) Save(dir string) error {
 	}
 	return nil
 }
-
 
 func CAFromEnv(dir string) *CA {
 	trust := os.Getenv("TRUST_DOMAIN")
@@ -291,7 +301,6 @@ func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
 
 	return nil
 }
-
 
 func (a *CA) GetToken(ctx context.Context, aud string) (string, error) {
 	jwt := &JWT{

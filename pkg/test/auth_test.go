@@ -1,4 +1,4 @@
-package meshauth
+package test
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/costinm/meshauth"
 	"github.com/costinm/meshauth/pkg/stsd"
 )
 
@@ -23,19 +24,19 @@ func TestJWKS(t *testing.T) {
 	ctx := context.Background()
 
 	// Init the CA - this normally runs on a remote server with ACME certs.
-	ca := CAFromEnv("testdata/ca")
+	ca := meshauth.CAFromEnv("../testdata/ca")
 
 	mauth := ca.NewID("istio-system", "istiod", nil)
 
 	laddr := startServer(t, ca, mauth)
 	// TODO: start an auth server
 
-	cfg := &AuthnConfig{
-		Issuers: []*TrustConfig{
-			&TrustConfig{
+	cfg := &meshauth.AuthnConfig{
+		Issuers: []*meshauth.TrustConfig{
+			&meshauth.TrustConfig{
 				Issuer: "https://accounts.google.com",
 			},
-			&TrustConfig{
+			&meshauth.TrustConfig{
 				Issuer: "https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1",
 			},
 			//&TrustConfig{
@@ -43,9 +44,9 @@ func TestJWKS(t *testing.T) {
 			//},
 		},
 	}
-	ja := NewAuthn(cfg)
+	ja := meshauth.NewAuthn(cfg)
 
-	l := &TrustConfig{
+	l := &meshauth.TrustConfig{
 		Issuer: "http://" + laddr,
 	}
 	err := ja.UpdateKeys(ctx, l)
@@ -64,7 +65,7 @@ func TestJWKS(t *testing.T) {
 	defer cf()
 
 	// Will get K8S tokens to authenticate, with istio-ca audience
-	stsc := NewFederatedTokenSource(&STSAuthConfig{
+	stsc := meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
 		STSEndpoint: "http://" + laddr + "/v1/token",
 		TokenSource: ca, // def.NewK8STokenSource("istio-ca"),
 	})
@@ -74,7 +75,7 @@ func TestJWKS(t *testing.T) {
 		t.Fatal("STSc token ", err)
 	}
 
-	mdsc := &MDS{
+	mdsc := &meshauth.MDS{
 		Addr: "http://" + laddr + "/computeMetadata/v1",
 	}
 
@@ -97,7 +98,7 @@ func TestJWKS(t *testing.T) {
 // - local metadata server
 //
 // TODO: alternative is to run xmdsd in testdata dir.
-func startServer(t *testing.T, ca *CA, mauth *MeshAuth) string {
+func startServer(t *testing.T, ca *meshauth.CA, mauth *meshauth.MeshAuth) string {
 	l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 0})
 	if err != nil {
 		t.Fatal("Listen")
@@ -105,9 +106,9 @@ func startServer(t *testing.T, ca *CA, mauth *MeshAuth) string {
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	addr := fmt.Sprintf("localhost:%s", p)
 
-	authn := NewAuthn(&AuthnConfig{
-		Issuers: []*TrustConfig{
-			&TrustConfig{
+	authn := meshauth.NewAuthn(&meshauth.AuthnConfig{
+		Issuers: []*meshauth.TrustConfig{
+			&meshauth.TrustConfig{
 				Issuer: "http://" + addr,
 			},
 		},
@@ -115,18 +116,18 @@ func startServer(t *testing.T, ca *CA, mauth *MeshAuth) string {
 	// An STS server returning tokens signed by the CA.
 	sts := &stsd.TokenExchangeD{
 		Authn: authn,
-		Generate: func(ctx context.Context, jwt *JWT, aud string) (string, error) {
+		Generate: func(ctx context.Context, jwt *meshauth.JWT, aud string) (string, error) {
 			return ca.GetToken(ctx, aud)
 		},
 	}
 
-	mds := &MDS{}
+	mds := &meshauth.MDS{}
 
 	mux := &http.ServeMux{}
 
 	mux.Handle("/v1/token", sts)
 
-	mux.Handle("/computeMetadata/v1/", mds)
+	mux.HandleFunc("/computeMetadata/v1/", mds.HandleMDS)
 	mux.HandleFunc("/.well-known/openid-configuration", mauth.HandleDisc)
 	mux.HandleFunc("/.well-known/jwks", ca.HandleJWK)
 	mux.HandleFunc("/jwks", ca.HandleJWK)
@@ -149,11 +150,11 @@ func checkJWT(t *testing.T, jwt string) {
 	// Example of google JWT in cloudrun:
 	// eyJhbGciOiJSUzI1NiIsImtpZCI6IjBlNzJkYTFkZjUwMWNhNmY3NTZiZjEwM2ZkN2M3MjAyOTQ3NzI1MDYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiIzMjU1NTk0MDU1OS5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSIsImF1ZCI6IjMyNTU1OTQwNTU5LmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29tIiwic3ViIjoiMTA0MzY2MjYxNjgxNjMwMTM4NTIzIiwiZW1haWwiOiJjb3N0aW5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiJ1MTIwMzhrTTh2THcyZGN0dnVvbTdBIiwiaWF0IjoxNzAwODg0MDAwLCJleHAiOjE3MDA4ODc2MDB9.SIGNATURE_REMOVED_BY_GOOGLE"
 
-	cfg := &AuthnConfig{}
+	cfg := &meshauth.AuthnConfig{}
 
-	cfg.Issuers = []*TrustConfig{{Issuer: "https://accounts.google.com"}}
+	cfg.Issuers = []*meshauth.TrustConfig{{Issuer: "https://accounts.google.com"}}
 
-	ja := NewAuthn(cfg)
+	ja := meshauth.NewAuthn(cfg)
 
 	// May use a custom method too with lower deps
 	//ja.Verify = oidc.Verify
@@ -175,7 +176,7 @@ func TestVapid(t *testing.T) {
 	rfcEx := "vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczovL3B1c2guZXhhbXBsZS5uZXQiLCJleHAiOjE0NTM1MjM3NjgsInN1YiI6Im1haWx0bzpwdXNoQGV4YW1wbGUuY29tIn0.i3CYb7t4xfxCDquptFOepC9GAu_HLGkMlMuCGSK2rpiUfnK9ojFwDXb1JrErtmysazNjjvW2L9OkSSHzvoD1oA, " +
 		"k=BA1Hxzyi1RUM1b5wjxsn7nGxAszw2u61m164i3MrAIxHF6YK5h4SDYic-dRuU_RCPCfA5aq9ojSwk5Y2EmClBPs"
 
-	rfcT, rfcP, err := CheckVAPID(rfcEx, time.Time{})
+	rfcT, rfcP, err := meshauth.CheckVAPID(rfcEx, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,13 +187,13 @@ func TestVapid(t *testing.T) {
 	}
 	log.Println(len(rfcP), rfcT)
 
-	alice := NewMeshAuth(&MeshCfg{
+	alice := meshauth.NewMeshAuth(&meshauth.MeshCfg{
 		Domain: "test.sender"}).InitSelfSigned("")
 
 	bobToken := alice.VAPIDToken("bob")
 	log.Println("Authorization: " + bobToken)
 
-	tok, pub, err := CheckVAPID(bobToken, time.Now())
+	tok, pub, err := meshauth.CheckVAPID(bobToken, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +203,7 @@ func TestVapid(t *testing.T) {
 	btb := []byte(bobToken)
 	btb[50]++
 	bobToken = string(btb)
-	_, _, err = CheckVAPID(bobToken, time.Now())
+	_, _, err = meshauth.CheckVAPID(bobToken, time.Now())
 	if err == nil {
 		t.Fatal("Expecting error")
 	}
@@ -233,7 +234,7 @@ func TestSigFail(t *testing.T) {
 
 	sig, _ := hex.DecodeString("9930116d656c7b977a46ca948eb7c49f0fe9b4fe11ae3790bbd8ed47d71135278ddda2d3f9b1aafdad08a14e38b5fc71e41527b0aecda7ce307ef23a8f0f8ee1")
 
-	ok := Verify(payloadhex, payloadhex[len(payloadhex)-64:], sig)
+	ok := meshauth.Verify(payloadhex, payloadhex[len(payloadhex)-64:], sig)
 	log.Println(ok)
 
 }
@@ -268,7 +269,7 @@ func TestSig(t *testing.T) {
 
 	log.Println("R:", hex.EncodeToString(r.Bytes()), hex.EncodeToString(s.Bytes()))
 
-	err := Verify(pubb[1:65], pubb[1:65], sig)
+	err := meshauth.Verify(pubb[1:65], pubb[1:65], sig)
 	if err != nil {
 		t.Error(err)
 	}
@@ -313,12 +314,12 @@ func BenchmarkVerify(b *testing.B) {
 	sig := append(rBytesPadded, sBytesPadded...)
 
 	for i := 0; i < b.N; i++ {
-		Verify(pubb, pubb, sig)
+		meshauth.Verify(pubb, pubb, sig)
 	}
 }
 
 func TestXFCC(t *testing.T) {
-	vals := ParseXFCC(`By=spiffe://cluster.local/ns/ssh-ca/sa/default;Hash=8813da93b;Subject="";URI=spiffe://cluster.local/ns/sshd/sa/default`)
+	vals := meshauth.ParseXFCC(`By=spiffe://cluster.local/ns/ssh-ca/sa/default;Hash=8813da93b;Subject="";URI=spiffe://cluster.local/ns/sshd/sa/default`)
 	if vals["By"] != "spiffe://cluster.local/ns/ssh-ca/sa/default" {
 		t.Error("Missing By")
 	}

@@ -112,11 +112,16 @@ func (jauthn *Authn) Auth(actx *AuthContext, r *http.Request) error {
 			return err
 		}
 
+		actx.JWTs = append(actx.JWTs, jt)
 		if jt.Email != "" {
-			r.Header["X-User"] = []string{jt.Email}
+			actx.Client = jt.Email
 		} else {
-			r.Header["X-User"] = []string{jt.Sub}
+			actx.Client = jt.Sub
 		}
+		if actx.Client != "" {
+			r.Header["X-User"] = []string{actx.Client}
+		}
+
 	} else if strings.HasPrefix(rawa, "vapid") {
 		tok, pub, err := CheckVAPID(rawa, time.Now())
 		if err != nil {
@@ -303,7 +308,7 @@ func (ja *Authn) FetchAllKeys(ctx context.Context, issuers []*TrustConfig) error
 			errs = append(errs, err)
 		}
 	}
-	if time.Since(t0) > 1 * time.Second {
+	if time.Since(t0) > 1*time.Second {
 		slog.Info("Issuer init ", "d", time.Since(t0))
 	}
 	if len(errs) > 0 {

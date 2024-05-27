@@ -29,7 +29,9 @@ import (
 )
 
 // From nodeagent/plugin/providers/google/stsclient
-// In Istio, the code is used if "GoogleCA" is set as CA_PROVIDER or CA_ADDR has the right prefix
+// In Istio, the code was used if "GoogleCA" is set as CA_PROVIDER or CA_ADDR has the right prefix
+
+// The STS protocol is standard - this file has defaults for Google URLs.
 
 var (
 	// secureTokenEndpoint is the Endpoint the STS client calls to.
@@ -95,8 +97,12 @@ type STSAuthConfig struct {
 	//			k8s-${WORKLOAD_NAMESPACE}@${PROJECT_ID}.iam.gserviceaccount.com
 	GSA string
 
-	// If true, the token source returns access tokens directly.
-	// This will just impersonate.
+	// If true, the TokenSource returns access tokens directly.
+	// If false, the TokenSource is K8S-based and used to returns K8S JWTs with
+	// AudienceSource, further exchanged to federated access tokens, and if GSA is
+	// set to service JWT or access tokens.
+	//
+	// Federated tokens also require cluster info.
 	GCPDelegate bool
 
 	// UseAccessToken forces return of access tokens for google, even if 'aud' is set
@@ -147,20 +153,26 @@ func ToMeta(t string) map[string]string {
 	return res
 }
 
+// GetToken for STS returns an access token if aud is empty.
 func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
-	// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
-	kt, err := s.cfg.TokenSource.GetToken(ctx, s.cfg.AudienceSource)
-	if err != nil {
-		return "", err
-	}
+	var federatedAccessToken string
+	var err error
 
-	var ft string
 	if s.cfg.GCPDelegate {
-		ft = kt
+		// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
+		federatedAccessToken, err = s.cfg.TokenSource.GetToken(ctx, "")
+		if err != nil {
+			return "", err
+		}
 	} else {
+		// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
+		kt, err := s.cfg.TokenSource.GetToken(ctx, s.cfg.AudienceSource)
+		if err != nil {
+			return "", err
+		}
 
 		// Federated token - a google access token equivalent with the k8s JWT, using STS
-		ft, err = s.tokenFederated(ctx, kt, aud)
+		federatedAccessToken, err = s.exchangeK8SJWT2FederatedAccessToken(ctx, kt, aud)
 		if err != nil {
 			return "", err
 		}
@@ -170,17 +182,18 @@ func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
 
 	if s.cfg.GSA != "" {
 		// GCP special config - the token exchange can't delegate, so a 3rd roundtrip is needed
-		return s.TokenGSA(ctx, ft, aud)
+		return s.TokenGSA(ctx, federatedAccessToken, aud)
 	}
 
-	return ft, nil
+	return federatedAccessToken, nil
 }
 
 // TokenFederated exchanges the K8S JWT with a federated token - an google access token representing
 // the K8S identity (and not a regular GSA!).
 //
 // (formerly called ExchangeToken)
-func (s *STS) tokenFederated(ctx context.Context, subjectToken string, aud string) (string, error) {
+func (s *STS) exchangeK8SJWT2FederatedAccessToken(ctx context.Context, subjectToken string, aud string) (string, error) {
+
 	if s.cfg.ClusterAddress == "" {
 		// First time - construct it from the K8S token
 		j := DecodeJWT(subjectToken)

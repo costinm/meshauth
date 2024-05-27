@@ -8,6 +8,7 @@ import (
 
 // AuthContext is a Context implementation holding auth info for a request.
 type AuthContext struct {
+	// Workload auth config
 	MeshAuth *MeshAuth
 
 	// Parent
@@ -15,12 +16,16 @@ type AuthContext struct {
 
 	// Slog
 	Logger *slog.Logger
-	Start  time.Time
+
+	Start time.Time
 
 	// Metrics/Tracing
 
 	// Auth info for this context
+	Client string
+	Peer   string
 
+	JWTs []*JWT
 	// Original IP and metadata.
 }
 
