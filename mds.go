@@ -57,23 +57,6 @@ type MDS struct {
 	Meta sync.Map
 }
 
-// Metadata is the root of the GCP metadata.
-// Using it as a base, to avoid conversions and mappings.
-type Metadata struct {
-	Instance Instance `json:"instance"`
-}
-
-type Project struct {
-	SSHKeys string `json:"sshKeys"`
-}
-
-type Instance struct {
-	SSHKeys    string `json:"ssh-keys"`
-	InstanceID int    `json:"id"`
-	Zone       string `json:"zone"`
-	Name       string `json:"name"`
-}
-
 // Determine the workload name, using environment variables or hostname.
 // This should be unique, typically pod-xxx-yyy
 func (mds *MDS) WorkloadName() string {

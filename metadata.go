@@ -1,8 +1,9 @@
-package util
+package meshauth
 
 // Metadata represents info about the current instance.
 // Some info is only available on VMs or CloudRun.
 type Metadata struct {
+
 	Instance struct {
 		Attributes struct {
 			// Only GKE
@@ -28,6 +29,7 @@ type Metadata struct {
 		//     "hostname": "gke-CLUSTER_NAME-pool-1-1b6cad60-1l3a.c.costin-asm1.internal",
 		// This is the FQDN hostname of the node !
 		Hostname string
+
 		ID       int
 
 		// Local part of the hostname.
@@ -66,9 +68,10 @@ type Metadata struct {
 		NumericProjectId int
 		ProjectId        string
 
-		// Only on GCP
+		// Only on GCP VMs
 		Attributes map[string]string
 		// 	SSHKeys2 string
-		//	SSHKeys string
+
+		SSHKeys string `json:"sshKeys"`
 	}
 }

@@ -1,16 +1,16 @@
 package util
 
 import (
-	"encoding/json"
 	"log"
 	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/costinm/meshauth"
 )
 
 // Main helper provides boilerplate utilities for running a main()
@@ -18,69 +18,12 @@ import (
 
 var startupTime = time.Now()
 
+
 // FindConfig is a simple loader for a config file.
 func FindConfig(base string, s string) []byte {
-
-	basecfg := os.Getenv(base)
-	if basecfg != "" {
-		return []byte(basecfg)
-	}
-
-	fb, err := os.ReadFile("./" + base + s)
-	if err == nil {
-		return fb
-	}
-
-	fb, err = os.ReadFile("/" + base + "/" + base + s)
-	if err == nil {
-		return fb
-	}
-
-	// Also look in the .ssh directory - this is mainly for secrets.
-	fb, err = os.ReadFile(os.Getenv("HOME") + "/.ssh/" + base + s)
-	if err == nil {
-		return fb
-	}
-
-	return nil
+	return meshauth.FindConfig(base, s)
 }
 
-// MainStart is an opinionated startup - configures build in components.
-// 'base' is the name of the config - for example 'mds'
-// If it is set as an environment variable - it is expected to be a json config.
-// Otherwise, a file /$base/$base.json or ./$base.json will be loaded.
-// Other env variables of type string may be merged into the config.
-//
-// - Will init slog with a json handler
-//
-// Larger binaries should use viper - which provides support for:
-// - ini, json, yaml, java properties
-// - remote providers (with encryption) - built in etcd3, consul, firestore
-func MainStart(base string, out interface{}) error {
-	basecfg := FindConfig(base, ".json")
-	if basecfg != nil {
-		err := json.Unmarshal([]byte(basecfg), out)
-		if err !=  nil {
-			return err
-		}
-	}
-
-	// Quick hack to load environment variables into the config struct.
-	envl := os.Environ()
-	envm := map[string]string{}
-	for _, k := range envl {
-		kv := strings.SplitN(k, "=", 2)
-		if len(kv) == 2 {
-			envm[kv[0]] = kv[1]
-		}
-	}
-	envb, err := json.Marshal(envm)
-	if err != nil {
-		log.Println("Failed to overlay env", envl, err, envb)
-	}
-
-	return json.Unmarshal(envb, out)
-}
 
 // Main config helper - base implementation for minimal deps CLI.
 //

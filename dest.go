@@ -308,6 +308,37 @@ func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
 	return nil
 }
 
+type tokenSourceFunc func(ctx context.Context, aut string) (string, error)
+
+func (f tokenSourceFunc) GetToken(ctx context.Context, aut string) (string, error) {
+	return f(ctx, aut)
+}
+
+func (c *Dest) TokenGetter(ma *MeshAuth) TokenSource {
+	return tokenSourceFunc(func(ctx context.Context, aut string) (string, error) {
+		if c.TokenSource != "" {
+			tp := ma.AuthProviders[c.TokenSource]
+			if tp != nil {
+				t, err := tp.GetToken(ctx, aut)
+				if err != nil {
+					return "", err
+				}
+				return t, nil
+			}
+		}
+		if c.TokenProvider != nil {
+			t, err := c.TokenProvider.GetToken(ctx, aut)
+			if err != nil {
+				return "", err
+			}
+			return t, nil
+		}
+
+		// TODO: use default workload identity token source for MeshAuth
+		return "", nil
+	})
+}
+
 func (d *Dest) CertPool() *x509.CertPool {
 	if d.roots == nil {
 		d.roots = x509.NewCertPool()

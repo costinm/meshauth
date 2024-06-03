@@ -109,6 +109,9 @@ func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 	if auth.Cert != nil {
 		return auth // got a cert
 	}
+
+
+
 	//var keyPEM, certPEM []byte
 	var tlsCert tls.Certificate
 	if kty == "ed25519" {
@@ -118,6 +121,18 @@ func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
 		tlsCert, _, _ = auth.generateSelfSigned("rsa", priv, auth.Name+"."+auth.Domain)
 	} else {
+		if auth.MeshCfg.Priv != "" {
+			// Use pre-defined private key
+			block, _ := pem.Decode([]byte(auth.MeshCfg.Priv))
+			if block != nil {
+				if block.Type == "EC PRIVATE KEY" {
+					privk, _ := x509.ParseECPrivateKey(block.Bytes)
+					tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.Domain)
+					auth.SetTLSCertificate(&tlsCert)
+					return auth
+				}
+			}
+		}
 		privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.Domain)
 	}
@@ -127,7 +142,7 @@ func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
 
 // mesh certificates - new style
 const (
-	workloadCertDir = "/var/run/secrets/workload-spiffe-credentials"
+	varRunSecretsWorkloadSpiffeCredentials = "/var/run/secrets/workload-spiffe-credentials"
 
 	// Different from typical Istio  and CertManager key.pem - we can check both
 	//privateKey = "private_key.pem"
@@ -135,11 +150,10 @@ const (
 	// Also different, we'll check all. CertManager uses cert.pem
 	//cert = "certificates.pem"
 
-	// CertManager-style
-	workloadRootCAs = "ca.crt"
-	privateKey      = "tls.key"
-
-	cert = "tls.crt"
+	// CertManager-style file names. Used as default certs when saving and loading
+	caCrt  = "ca.crt"
+	tlsKey = "tls.key"
+	tlsCrt = "tls.crt"
 
 	// This is derived from CA certs plus all TrustAnchors.
 	// In GKE, it is expected that Citadel roots will be configure using TrustConfig - so they are visible
@@ -148,7 +162,7 @@ const (
 	// Outside of GKE, this is loaded from the mesh.env - the mesh gate is responsible to keep it up to date.
 	rootCAs = "ca_certificates.pem"
 
-	legacyCertDir = "/etc/certs"
+	etcCerts = "/etc/certs"
 )
 
 var base32Enc = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -318,16 +332,16 @@ func (a *MeshAuth) GetCertificate(ctx context.Context, sni string) (*tls.Certifi
 	return a.Cert, nil
 }
 
-// loadCertFromDir will attempt to read from a cert directory, attempting well-known file names
-// private key and cert may also be set in the config 'priv' and 'cert' fields.
+// loadCertFromDir will attempt to read from a tlsCrt directory, attempting well-known file names
+// private key and tlsCrt may also be set in the config 'priv' and 'cert' fields.
 //
-// Because it is not possible to get back the cert bytes from cert, return it as well.
+// Because it is not possible to get back the tlsCrt bytes from tlsCrt, return it as well.
 func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
 	// SetCert cert from file
 	keyFile := filepath.Join(dir, "key.pem")
 	keyBytes, err := ioutil.ReadFile(keyFile)
 	if err != nil {
-		keyFile = filepath.Join(dir, privateKey)
+		keyFile = filepath.Join(dir, tlsKey)
 		keyBytes, err = ioutil.ReadFile(keyFile)
 	}
 	if err != nil {
@@ -335,7 +349,7 @@ func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
 	}
 	certBytes, err := ioutil.ReadFile(filepath.Join(dir, "cert-chain.pem"))
 	if err != nil {
-		certBytes, err = ioutil.ReadFile(filepath.Join(dir, cert))
+		certBytes, err = ioutil.ReadFile(filepath.Join(dir, tlsCrt))
 	}
 	if err != nil {
 		return nil, nil, err
@@ -418,7 +432,7 @@ func (a *MeshAuth) initFromDir() error {
 	}
 
 	// Similar with /etc/ssl/certs/ca-certificates.crt - the concatenated list of PEM certs.
-	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, workloadRootCAs))
+	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, caCrt))
 	if rootCertExtra != nil {
 		err2 := a.AddRoots(rootCertExtra)
 		if err2 != nil {
@@ -491,11 +505,11 @@ func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
 // and using hostname as the name.
 func (a *MeshAuth) SaveCerts(outDir string) error {
 	if outDir == "" {
-		outDir = workloadCertDir
+		outDir = varRunSecretsWorkloadSpiffeCredentials
 	}
 	err := os.MkdirAll(outDir, 0755)
 	// TODO: merge other roots as needed - this is Istio XDS server root.
-	rootFile := filepath.Join(outDir, workloadRootCAs)
+	rootFile := filepath.Join(outDir, caCrt)
 	if err != nil {
 		return err
 	}
@@ -512,8 +526,8 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 		return err
 	}
 
-	keyFile := filepath.Join(outDir, privateKey)
-	chainFile := filepath.Join(outDir, cert)
+	keyFile := filepath.Join(outDir, tlsKey)
+	chainFile := filepath.Join(outDir, tlsCrt)
 	os.MkdirAll(outDir, 0755)
 
 	p := MarshalPrivateKey(a.Cert.PrivateKey)
@@ -530,11 +544,11 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 		bb.Write(b)
 	}
 
-	err = ioutil.WriteFile(keyFile, p, 0666)
+	err = os.WriteFile(keyFile, p, 0666)
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(chainFile, bb.Bytes(), 0666)
+	err = os.WriteFile(chainFile, bb.Bytes(), 0666)
 	if err != nil {
 		return err
 	}
@@ -564,11 +578,11 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 // This is done by setting "CA_PROVIDER=GoogleGkeWorkloadCertificate" when starting pilot-agent
 func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error {
 	if certDir == "" {
-		certDir = workloadCertDir
+		certDir = varRunSecretsWorkloadSpiffeCredentials
 	}
 	var err error
-	keyFile := filepath.Join(certDir, privateKey)
-	chainFile := filepath.Join(certDir, cert)
+	keyFile := filepath.Join(certDir, tlsKey)
+	chainFile := filepath.Join(certDir, tlsCrt)
 	privPEM, err := os.ReadFile(keyFile)
 	certPEM, err := os.ReadFile(chainFile)
 

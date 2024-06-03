@@ -46,7 +46,7 @@ func TestCerts(t *testing.T) {
 		Domain:  "test.mesh.local",
 	})
 
-	bob, _ := FromEnv(&MeshCfg{
+	bob, _ := FromEnv(context.Background(), &MeshCfg{
 		AllowedNamespaces: []string{"alicens"},
 		CertDir:           "testdata/bob",
 		Domain:            "test.mesh.local", // bug - fix cert generation for intermdiate

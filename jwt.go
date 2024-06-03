@@ -144,6 +144,8 @@ func TokenPayload(jwt string) string {
 
 // DecodeJWT decodes the content of a token. No signature checks.
 func DecodeJWT(jwt string) *JWT {
+	jwt = strings.TrimPrefix(jwt, "Bearer ")
+	jwt = strings.TrimPrefix(jwt, "bearer ")
 	_, j, _, _, _ := JwtRawParse(jwt)
 	return j
 }

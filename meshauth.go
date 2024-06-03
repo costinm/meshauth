@@ -2,18 +2,22 @@ package meshauth
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/costinm/meshauth/util"
 )
 
 var (
@@ -99,7 +103,7 @@ type MeshCfg struct {
 	ec256Priv []byte `json:-`
 
 	// MDS is the serialized recursive metadata - also stored as file or cached.
-	MDS *util.Metadata `json:"mds,omitempty"`
+	MDS *Metadata `json:"mds,omitempty"`
 
 	// TokenProvider is a URL used to get access tokens, as a GCP-like MDS server,
 	// for client.
@@ -404,11 +408,6 @@ func (l *PortListener) GetPort() int32 {
 type MeshAuth struct {
 	*MeshCfg
 
-	// Primary workload ID TLS certificate and private key. Loaded or generated.
-	// Default is to use EC256 certs. The private key can be used to sign JWTs.
-	// The public key and sha can be used as a node identity.
-	Cert *tls.Certificate
-
 	// cached PublicKeyBase64 encoding of the public key, for EC256 VAPID.
 	PublicKeyBase64 string
 
@@ -434,6 +433,11 @@ type MeshAuth struct {
 
 	// Same as VIP6, but as uint64
 	VIP64 uint64
+
+	// Primary workload ID TLS certificate and private key. Loaded or generated.
+	// Default is to use EC256 certs. The private key can be used to sign JWTs.
+	// The public key and sha can be used as a node identity.
+	Cert *tls.Certificate
 
 	// Explicit certificates (lego), key is hostname from file
 	//
@@ -462,6 +466,10 @@ type MeshAuth struct {
 
 	// Location is the location of the node - derived from MDS or config.
 	Location string
+}
+
+func (auth *MeshAuth) GetCert() *tls.Certificate {
+	return auth.Cert
 }
 
 // Interface for very simple storage abstraction.
@@ -519,8 +527,14 @@ func NewMeshAuth(cfg *MeshCfg) *MeshAuth {
 	if cfg == nil {
 		cfg = &MeshCfg{}
 	}
+	if cfg.MDS == nil {
+		cfg.MDS = &Metadata{}
+	}
 	if cfg.Dst == nil {
 		cfg.Dst = map[string]*Dest{}
+	}
+	if cfg.Listeners == nil {
+		cfg.Listeners = map[string]*PortListener{}
 	}
 	a := &MeshAuth{
 		MeshCfg:       cfg,
@@ -563,6 +577,93 @@ func NewMeshAuth(cfg *MeshCfg) *MeshAuth {
 	return a
 }
 
+// FindConfig is a simple loader for a config file.
+func FindConfig(base string, s string) []byte {
+
+	basecfg := os.Getenv(base)
+	if basecfg != "" {
+		return []byte(basecfg)
+	}
+
+	fb, err := os.ReadFile("./" + base + s)
+	if err == nil {
+		return fb
+	}
+
+	fb, err = os.ReadFile("/" + base + "/" + base + s)
+	if err == nil {
+		return fb
+	}
+
+	// Also look in the .ssh directory - this is mainly for secrets.
+	fb, err = os.ReadFile(os.Getenv("HOME") + "/.ssh/" + base + s)
+	if err == nil {
+		return fb
+	}
+
+	return nil
+}
+
+// FindConfig will look in all config sources associated with the mesh
+// and attempt to locate the config.
+func (ma *MeshAuth) FindConfig(base string, suffix string) []byte {
+
+	basecfg := os.Getenv(base)
+	if basecfg != "" {
+		return []byte(basecfg)
+	}
+
+	fb, err := os.ReadFile("./" + base + suffix)
+	if err == nil {
+		return fb
+	}
+
+	fb, err = os.ReadFile("/" + base + "/" + base + suffix)
+	if err == nil {
+		return fb
+	}
+
+	// Also look in the .ssh directory - this is mainly for secrets.
+	fb, err = os.ReadFile(os.Getenv("HOME") + "/.ssh/" + base + suffix)
+	if err == nil {
+		return fb
+	}
+
+	return nil
+}
+
+// LoadJsonEnv finds a config in a store, applies the environ overlay and unmarshalls it.
+func (ma *MeshAuth) LoadJsonEnv(base string, suffix string, out interface{}) error {
+	if suffix == "" {
+		suffix = ".json"
+	}
+	basecfg := FindConfig(base, suffix)
+	if basecfg != nil {
+		err := json.Unmarshal([]byte(basecfg), out)
+		if err !=  nil {
+			return err
+		}
+	}
+
+	// Quick hack to load environment variables into the config struct.
+	envl := os.Environ()
+	envm := map[string]string{}
+	for _, k := range envl {
+		kv := strings.SplitN(k, "=", 2)
+		if len(kv) == 2 {
+			envm[kv[0]] = kv[1]
+		}
+	}
+	envb, err := json.Marshal(envm)
+	if err != nil {
+		log.Println("Failed to overlay env", envl, err, envb)
+		return err
+	}
+
+	return json.Unmarshal(envb, out)
+}
+
+
 // FromEnv will attempt to identify and Init the certificates.
 // This should be called from main() and for normal app use.
 //
@@ -572,35 +673,45 @@ func NewMeshAuth(cfg *MeshCfg) *MeshAuth {
 // - default GKE/Istio location for workload identity
 // - /var/run/secrets/...FindC
 // - /etc/istio/certs
-// - $HOME/
+// - $HOME/.ssh/id_ecdsa - if it is in standard pem format
+//
+// ssh-keygen -t ecdsa -b 256 -m PEM -f id_ecdsa
+//
 //
 // If a cert is found, the identity is extracted from the cert. The
 // platform is expected to refresh the cert.
 //
 // If a cert is not found, Cert field will be nil, and the app should
 // use one of the methods of getting a cert or call InitSelfSigned.
-func FromEnv(cfg *MeshCfg) (*MeshAuth, error) {
-	a := NewMeshAuth(cfg)
+func FromEnv(ctx context.Context, cfg *MeshCfg) (*MeshAuth, error) {
+	return NewMeshAuth(cfg).FromEnv(ctx)
+}
 
-	// If running in K8S - and the pod config doesn't prevent access to K8S -
-	// detect and configure a KUBERNETES cluster and set self info from K8S env.
-	a.inCluster()
+// FromEnv will initialize MeshAuth using local files and env variables.
+// Should be used in 'main' - tests and programmatic use should be explicit.
+func (a *MeshAuth) FromEnv(ctx context.Context) (*MeshAuth, error) {
+	// Call all global modules, they may modify the mesh auth.
+	for _, f := range Modules {
+		f(ctx, a)
+	}
 
-	cfg = a.MeshCfg
+	cfg := a.MeshCfg
+
+	// Merge a found config and env variables.
+	a.LoadJsonEnv("mesh", "", cfg)
+
 	// Attempt to locate existing workload certs from the cert dir.
 	// TODO: attempt to get certs from an agent.
 	if cfg.CertDir == "" {
-		// Try to find the certificate directory
-		if _, err := os.Stat(filepath.Join("./", "key.pem")); !os.IsNotExist(err) {
+		// Try to find the 'default' certificate directory
+		if _, err := os.Stat(filepath.Join("./", tlsKey)); !os.IsNotExist(err) {
 			a.CertDir = "./"
-		} else if _, err := os.Stat(filepath.Join("./", "tls.key")); !os.IsNotExist(err) {
-			a.CertDir = "./"
-		} else if _, err := os.Stat(filepath.Join(workloadCertDir, privateKey)); !os.IsNotExist(err) {
-			a.CertDir = workloadCertDir
-		} else if _, err := os.Stat(filepath.Join(legacyCertDir, "key.pem")); !os.IsNotExist(err) {
-			a.CertDir = legacyCertDir
+		} else if _, err := os.Stat(filepath.Join(varRunSecretsWorkloadSpiffeCredentials, tlsKey)); !os.IsNotExist(err) {
+			a.CertDir = varRunSecretsWorkloadSpiffeCredentials
 		} else if _, err := os.Stat(filepath.Join("/var/run/secrets/istio", "key.pem")); !os.IsNotExist(err) {
 			a.CertDir = "/var/run/secrets/istio/"
+		} else if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".ssh", tlsKey)); !os.IsNotExist(err) {
+			a.CertDir = filepath.Join(os.Getenv("HOME"), ".ssh")
 		}
 	}
 
@@ -611,47 +722,6 @@ func FromEnv(cfg *MeshCfg) (*MeshAuth, error) {
 	return a, nil
 }
 
-func (ma *MeshAuth) inCluster() *Dest {
-	const (
-		tokenFile  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-		rootCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	)
-	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
-	if len(host) == 0 || len(port) == 0 {
-		return nil
-	}
-
-	token, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return nil
-	}
-
-	ca, err := os.ReadFile(rootCAFile)
-
-	fts := &FileTokenSource{TokenFile: tokenFile}
-	c := &Dest{
-		Addr:          "https://" + net.JoinHostPort(host, port),
-		TokenProvider: fts,
-	}
-	c.AddCACertPEM(ca)
-
-	namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err == nil {
-		ma.Namespace = string(namespace)
-	}
-
-	jwt := DecodeJWT(string(token))
-	if ma.Namespace == "" {
-		ma.Namespace = jwt.K8S.Namespace
-	}
-	if ma.Name == "" {
-		ma.Name = jwt.Name
-	}
-
-	ma.Dst["KUBERNETES"] = c
-
-	return c
-}
 
 // ------------ Helpers around TokenSource
 
@@ -778,3 +848,28 @@ func InitK8SInCluster(ma *MeshAuth) (*Dest, error) {
 
 	return c, nil
 }
+
+// NewCSR creates a key and CSR for the specified SAN (which may be ignored by
+// the CA and replaced with a reflexive identity).
+// It uses the primary identity in MeshAuth.
+func (a *MeshAuth) NewCSR(priv crypto.PrivateKey, san string) (csrPEM []byte, err error) {
+
+	// Exp: Istio overrides the SAN anyways, set it as org to see what happens.
+	csr := &x509.CertificateRequest{
+		Subject: pkix.Name{
+			Organization: []string{san},
+		},
+	}
+
+	// Istio sets spiffee - check what happens if a DNS is requested.
+	csr.DNSNames = []string{san}
+
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
+
+	encodeMsg := "CERTIFICATE REQUEST"
+
+	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
+
+	return
+}
+

@@ -15,11 +15,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -68,9 +66,10 @@ type CA struct {
 	TrustDomain string
 	prefix      string
 
+	// The Certificate may be signed by multiple intermediaries
 	IntermediatesPEM []byte
 
-	// Root certs
+	// Root certs that signed the root.
 	CACertPEM []byte
 
 	KeyType string
@@ -87,6 +86,7 @@ func NewCA(cfg *CAConfig) *CA {
 	ca.prefix = "spiffe://" + cfg.TrustDomain + "/ns/"
 	return ca
 }
+
 
 // NewTempCA creates a temporary/test CA.
 func NewTempCA(trust string) *CA {
@@ -155,19 +155,6 @@ func (ca *CA) Save(dir string) error {
 	return nil
 }
 
-func CAFromEnv(dir string) *CA {
-	trust := os.Getenv("TRUST_DOMAIN")
-
-	ca := NewCA(&CAConfig{TrustDomain: trust, RootLocation: dir})
-
-	err := ca.Init(dir)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return ca
-}
-
 // CertManager - intermediary certs have tls.key, tls.crt (std k8s)
 // plus ca.crt for the root CA. All certs issued with private CAs
 // have ca.crt - a CA cert is like any other cert.
@@ -222,64 +209,30 @@ func generateKey(kty string) crypto.PrivateKey {
 	return privk
 }
 
-// NewCertificate returns a Secret including certificates and optionally a private key.
-//
-// # WIP
-//
-// If the request has a public key, it will be used for the certs.
-//
-// V3: further simplification, certificates are just a APIserver extension using Secret as interface.
-// The cert is reflected from the request authentication.
-// Clients don't have any control (expected to be config-less) - the server policy decides.
-func (ca *CA) NewCertificate(w http.ResponseWriter, r *http.Request) {
-	// Must be wrapped in an auth handler that sets the context
-	// TODO: for sign, implement K8S cert signing interface - or get public from self-signed cert.
-
-}
-
 // NewTLSCert creates a new cert from this CA.
 func (ca *CA) NewTLSCert(ns, sa string, dns []string) (*tls.Certificate, []byte, []byte) {
 	nodeKey := generateKey("")
-	csr := certTemplate(ca.TrustDomain, ca.prefix+ns+"/sa/"+sa, dns...)
+	csr := ca.CertTemplate(ca.TrustDomain, ca.prefix+ns+"/sa/"+sa, dns...)
 
 	return ca.newTLSCertAndKey(csr, nodeKey, ca.Private, ca.CACert)
 }
 
-//func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
-//	var priv crypto.PrivateKey
-//
-//	rsaKey := generateKey("")
-//	priv = rsaKey
-//
-//	csr := &x509.CertificateRequest{
-//		Subject: pkix.Name{
-//			Organization: []string{san},
-//		},
-//	}
-//	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
-//
-//	encodeMsg := "CERTIFICATE REQUEST"
-//
-//	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
-//
-//	var encodedKey []byte
-//	switch k := priv.(type) {
-//	case *rsa.PrivateKey:
-//		encodedKey = x509.MarshalPKCS1PrivateKey(k)
-//		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
-//	case *ecdsa.PrivateKey:
-//		encodedKey, err = x509.MarshalECPrivateKey(k)
-//		if err != nil {
-//			return nil, nil, err
-//		}
-//		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
-//	}
-//
-//	return
-//}
+// PrivatePEM returns the private key, as PEM
+func (a *MeshAuth) PrivatePEM() (privPEM []byte) {
+	var encodedKey []byte
+	switch k := a.Cert.PrivateKey.(type) {
+	case *rsa.PrivateKey:
+		encodedKey = x509.MarshalPKCS1PrivateKey(k)
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
+	case *ecdsa.PrivateKey:
+		encodedKey, _ = x509.MarshalECPrivateKey(k)
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+	}
+	return
+}
 
-// signCertDER uses caPrivate to sign a cert, returns the DER format.
-// Used primarily for tests with self-signed cert.
+// signCertDER uses caPrivate to sign a tlsCrt, returns the DER format.
+// Used primarily for tests with self-signed tlsCrt.
 func signCertDER(template *x509.Certificate, pub crypto.PublicKey, caPrivate crypto.PrivateKey, parent *x509.Certificate) ([]byte, error) {
 	certDER, err := x509.CreateCertificate(rand.Reader, template, parent, pub, caPrivate)
 	if err != nil {
@@ -334,7 +287,7 @@ func (a *CA) HandleJWK(w http.ResponseWriter, r *http.Request) {
 	//		"x"   : "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
 }
 
-func certTemplate(org string, urlSAN string, sans ...string) *x509.Certificate {
+func (ca *CA) CertTemplate(org string, urlSAN string, sans ...string) *x509.Certificate {
 	var notBefore time.Time
 	notBefore = time.Now().Add(-1 * time.Hour)
 
@@ -429,6 +382,7 @@ func rootCert(org, ou, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey, 
 
 func (c *CA) newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey, ca crypto.PrivateKey, parent *x509.Certificate) (*tls.Certificate, []byte, []byte) {
 	pub := PublicKey(priv)
+
 	certDER, err := signCertDER(template, pub, ca, parent)
 	if err != nil {
 		return nil, nil, nil
@@ -453,4 +407,20 @@ func (c *CA) newTLSCertAndKey(template *x509.Certificate, priv crypto.PrivateKey
 	}
 
 	return &tlsCert, keyPEM, certPEM
+}
+
+func (c *CA) SignCertificate(template *x509.Certificate, pub crypto.PublicKey) (string) {
+
+	certDER, err := signCertDER(template, pub, c.Private, c.CACert)
+	if err != nil {
+		return ""
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: blockTypeCertificate, Bytes: certDER})
+
+	// Add intermediate CA, if any and the root - for istio compat and to allow
+	// checking the chain using root SHA
+	certPEM = append(certPEM, c.CACertPEM...)
+
+	return string(certPEM)
 }

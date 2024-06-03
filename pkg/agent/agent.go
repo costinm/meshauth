@@ -17,15 +17,11 @@ type Config struct {
 
 var stop = make(chan struct{})
 
-func SetupAgent(ctx context.Context, maCfg *meshauth.MeshCfg, k meshauth.TokenSource,
-	mux *http.ServeMux) (*meshauth.MeshAuth, error) {
+func SetupAgent(ctx context.Context, ma *meshauth.MeshAuth, maCfg *meshauth.MeshCfg, k meshauth.TokenSource,
+	mux *http.ServeMux) (error) {
 	// Auto-detect the environment and mesh certificates, if any.
 	// TODO: detect the istio-mounted istio-ca scoped token location and use it as a source.
 	// On CloudRun or regular VMs - will not detect anything unless a secret is mounted.
-	ma, err := meshauth.FromEnv(maCfg)
-	if err != nil {
-		return nil, err
-	}
 
 	ma.AuthProviders["k8s"] = k
 
@@ -61,5 +57,5 @@ func SetupAgent(ctx context.Context, maCfg *meshauth.MeshCfg, k meshauth.TokenSo
 		log.Println("DefaultCredentials check from", request.RemoteAddr)
 	})
 
-	return ma, nil
+	return nil
 }
