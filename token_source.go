@@ -2,119 +2,49 @@ package meshauth
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net/http"
+	"io/ioutil"
+	"os"
+	"sync"
+	"time"
 )
 
 // Common token sources and interface.
+//
 // sts.go implements a OAuth2/SecureTokenService token source.
+// mds.go implements a GCP-like HTTP token and metadata source.
+// pkg/webpush/vapid implements a VAPID token source - but returns the full header, not just the token
 
-// K8STokenSource provides authentication and basic communication with a K8S cluster.
-// The main purpose is to handle what is needed for auth and provisioning - loading
-// secrets and config maps and getting tokens.
-//
-// K8S is an identity provider, and supports multiple credential types for exchange.
-// If the app runs in K8S, it expects to find info in well-known locations.
-// If it doesn't - it expects to have a KUBECONFIG or ~/.kube/config - or some
-// other mechanism to get the address/credentials.
-type K8STokenSource struct {
-	// Dest is the common set of properties for any server we connect as client.
-	// (hostname or IP, expected SANs and roots ).
-	*Dest
-
-	// Namespace and KSA - the 'cluster' credentials must have the RBAC permissions.
-	// The user in the Cluster is typically admin - or may be the
-	// same user, but have RBAC to call TokenRequest.
-	Namespace      string
-	ServiceAccount string
+// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
+type TokenSource interface {
+	// GetToken for a given audience.
+	GetToken(context.Context, string) (string, error)
 }
 
-// TODO: Exec access, using /usr/lib/google-cloud-sdk/bin/gke-gcloud-auth-plugin (11M) for example
-//  name: gke_costin-asm1_us-central1-c_td1
-//  user:
-//    exec:
-//      apiVersion: client.authentication.k8s.io/v1beta1
-//      command: gke-gcloud-auth-plugin
-//      provideClusterInfo: true
+type TokenSourceFunc func(context.Context, string) (string, error)
 
-// /usr/lib/google-cloud-sdk/bin/gke-gcloud-auth-plugin
-// {
-//    "kind": "ExecCredential",
-//    "apiVersion": "client.authentication.k8s.io/v1beta1",
-//    "spec": {
-//        "interactive": false
-//    },
-//    "status": {
-//        "expirationTimestamp": "2022-07-01T15:55:01Z",
-//        "token": ".." // ya29
-//    }
-//}
-
-func (k *K8STokenSource) GetToken(ctx context.Context, aud string) (string, error) {
-	return k.GetTokenRaw(ctx, k.Namespace, k.ServiceAccount, aud)
+func (f TokenSourceFunc) GetToken(ctx context.Context, aud string) (string, error) {
+	return f(ctx, aud)
 }
 
-// GetTokenRaw returns a K8S JWT with specified namespace, name and audience. Caller must have the RBAC
-// permission to act as the name.ns.
-//
-// Equivalent curl request:
-//
-//	token=$(echo '{"kind":"TokenRequest","apiVersion":"authentication.k8s.io/v1","spec":{"audiences":["istio-ca"], "expirationSeconds":2592000}}' | \
-//	   kubectl create --raw /api/v1/namespaces/default/serviceaccounts/default/token -f - | jq -j '.status.token')
-func (k *K8STokenSource) GetTokenRaw(ctx context.Context, ns, name, aud string) (string, error) {
-	// If no audience is specified, something like
-	//   https://container.googleapis.com/v1/projects/costin-asm1/locations/us-central1-c/clusters/big1
-	// is generated ( on GKE ) - which seems to be the audience for K8S
-	if ns == "" {
-		ns = "default"
-	}
-	if name == "" {
-		name = "default"
-	}
-
-	body := []byte(fmt.Sprintf(`{"kind":"TokenRequest","apiVersion":"authentication.k8s.io/v1","spec":{"audiences":["%s"]}}`, aud))
-
-	rr := &RESTRequest{
-		Method:    "POST",
-		Namespace: ns,
-		Kind:      "serviceaccount",
-		Name:      name,
-		Body:      body,
-		Query:     "/token",
-	}
-
-	data, err := k.Do(rr.HttpRequest(ctx, k.Dest)) // k.RequestAll(ctx, "POST", ns, "serviceaccount", name+"/token", body, ""))
-
-	if err != nil {
-		return "", err
-	}
-
-	var secret CreateTokenResponse
-	err = json.Unmarshal(data, &secret)
-	if err != nil {
-		return "", err
-	}
-
-	return secret.Status.Token, nil
-}
-
-func (k *K8STokenSource) Do(r *http.Request) ([]byte, error) {
-	res, err := k.Dest.HttpClient().Do(r)
-	if err != nil {
-		return nil, err
-	}
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, errors.New(fmt.Sprintf("K8S error %d %s", res.StatusCode, string(data)))
-	}
-	return data, nil
+// PerRPCCredentials defines the common interface for the credentials which need to
+// attach security information to every RPC (e.g., oauth2).
+// This is the interface used by gRPC - should be implemented by all TokenSource to
+// allow use with gRPC.
+type PerRPCCredentials interface {
+	// GetRequestMetadata gets the current request metadata, refreshing
+	// tokens if required. This should be called by the transport layer on
+	// each request, and the data should be populated in headers or other
+	// context. If a status code is returned, it will be used as the status
+	// for the RPC. uri is the URI of the entry point for the request.
+	// When supported by the underlying implementation, ctx can be used for
+	// timeout and cancellation. Additionally, RequestInfo data will be
+	// available via ctx to this call.
+	// TODO(zhaoq): Define the set of the qualified keys instead of leaving
+	// it as an arbitrary string.
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity indicates whether the credentials requires
+	// transport security.
+	RequireTransportSecurity() bool
 }
 
 //// Get a mesh env setting. May be replaced by an env variable.
@@ -197,3 +127,116 @@ func (k *K8STokenSource) Do(r *http.Request) ([]byte, error) {
 //    certificate-authority-data: "${K8SCA}"
 //
 //```
+
+type MountedTokenSource struct {
+	Base string
+}
+
+func (mds *MountedTokenSource) GetToken(ctx1 context.Context, aud string) (string, error) {
+	b := mds.Base
+	if b == "" {
+		b = "/var/run/secrets/mesh/tokens/"
+	}
+	tokenFile := b + "/" + aud
+	if _, err := os.Stat(tokenFile); err == nil {
+		data, err := ioutil.ReadFile(tokenFile)
+		if err != nil {
+			return "", err
+		} else {
+			return string(data), nil
+		}
+	}
+	return "", nil
+}
+
+// File or static token source
+type FileTokenSource struct {
+	TokenFile string
+}
+
+func (s *FileTokenSource) GetToken(context.Context, string) (string, error) {
+	if s.TokenFile != "" {
+		tfb, err := os.ReadFile(s.TokenFile)
+		if err != nil {
+			return "", err
+		}
+		return string(tfb), nil
+	}
+	return "", nil
+}
+
+type StaticTokenSource struct {
+	Token string
+}
+
+func (s *StaticTokenSource) GetToken(context.Context, string) (string, error) {
+	return s.Token, nil
+}
+
+type AudienceOverrideTokenSource struct {
+	TokenSource TokenSource
+	Audience    string
+}
+
+func (s *AudienceOverrideTokenSource) GetToken(ctx context.Context, _ string) (string, error) {
+	return s.TokenSource.GetToken(ctx, s.Audience)
+}
+
+
+// ------------ Helpers around TokenSource
+
+type PerRPCCredentialsFromTokenSource struct {
+	TokenSource
+}
+
+func (s *PerRPCCredentialsFromTokenSource) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	t, err := s.GetToken(ctx, uri[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]string{
+		"authorization": "Bearer " + t,
+	}, nil
+}
+
+func (s *PerRPCCredentialsFromTokenSource) RequireTransportSecurity() bool { return false }
+
+
+type TokenCache struct {
+	cache sync.Map
+	m     sync.Mutex
+
+	TokenSource TokenSource
+
+	// DefaultExpiration of tokens - 45 min if not set.
+	// TokenSource doesn't deal with expiration, in almost all cases 1h retry is ok.
+	DefaultExpiration time.Duration
+}
+
+func (c *TokenCache) Token(ctx context.Context, aud string) (string, error) {
+	if got, f := c.cache.Load(aud); f {
+		t := got.(*JWT)
+		if t.Expiry().After(time.Now().Add(-time.Minute)) {
+			return t.Raw, nil
+		}
+	}
+
+	t, err := c.TokenSource.GetToken(ctx, aud)
+	if err != nil {
+		return "", err
+	}
+
+	_, j, _, _, err := JwtRawParse(t)
+
+	if err != nil {
+		te := c.DefaultExpiration
+		if te == 0 {
+			te = 45 * time.Minute
+		}
+		j = &JWT{Raw: t, Exp: time.Now().Add(te).Unix()}
+	}
+
+	c.cache.Store(aud, j)
+	return t, nil
+}

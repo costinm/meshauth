@@ -1,14 +1,32 @@
 package meshauth
 
-// Authentication:
-// 1. client configs specific to how to talk to a destination. Include
-//   client certs, secrets, token sources. Attached to a host (xds_cluster)
-//   or default per gateway
-// 2. client config - how to validate a server - per host (xds_cluster) or
-//   default per gateway
-// 3. server config - certificates for port and SNI. Per listener or default.
-// 4. server config - how to validate clients. Per listener or default.
+import (
+	"context"
+	"net"
+)
+
+// ContextDialer is same with x.net.proxy.ContextDialer
+// Used to create the actual connection to an address using the mesh.
+// The result may have metadata, and be an instance of util.Stream.
 //
-// 2 and 4 have common config for cert based. We can also treat JWT as signed.
+// A uGate implements this interface, it is the primary interface
+// for creating streams where the caller does not want to pass custom
+// metadata. Based on net and addr and handshake, if destination is
+// capable we will upgrade to BTS and pass metadata. This may also
+// be sent via an egress gateway.
 //
+// For compatibility, 'net' can be "tcp" and addr a mangled hostname:port
+// Mesh addresses can be identified by the hostname or IP6 address.
+// External addresses will create direct connections if possible, or
+// use egress server.
 //
+// TODO: also support 'url' scheme
+type ContextDialer interface {
+	// Dial with a context based on tls package - 'once successfully
+	// connected, any expiration of the context will not affect the
+	// connection'.
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
+
+

@@ -33,7 +33,10 @@ import (
 	"time"
 )
 
-// Certificates are typically used with TLS and mTLS.
+// Certificates are typically used with TLS and mTLS, but the key is the primary
+// key of the workload.
+// This file has code related to loading and processing certs.
+// The end result is Mesh.Cert
 
 // TLS notes:
 // - using HandshakeContext with custom verification for workload identity (spiffe)
@@ -43,9 +46,105 @@ import (
 // - native library also supports nested TLS - if the RoundTripStart method is overriden and scheme is https,
 //    it will do a TLS handshake anyway and RoundTripStart can implement TLS for the outer tunnel.
 
-func (v *MeshAuth) setEC256Vapid() {
-	publicUncomp, _ := base64.RawURLEncoding.DecodeString(v.EC256Pub)
-	privateUncomp, _ := base64.RawURLEncoding.DecodeString(v.EC256Key)
+
+// initFromCert initializes the MeshTLSConfig with the workload certificate
+// Called after a.Cert has been set.
+func (mesh *Mesh) initFromCert() {
+	if mesh.Cert == nil {
+		return
+	}
+	_, td, ns, n := mesh.Spiffee()
+	if mesh.Domain == "" {
+		mesh.Domain = td
+	}
+	if mesh.Namespace == "" {
+		mesh.Namespace = ns
+	}
+	if mesh.Name == "" {
+		mesh.Name = n
+	}
+
+	publicKey := mesh.leaf().PublicKey
+	mesh.PublicKey = MarshalPublicKey(publicKey)
+	if mesh.Priv == "" {
+		mesh.Priv = string(MarshalPrivateKey(mesh.Cert.PrivateKey))
+	}
+
+
+	mesh.VIP6 = Pub2VIP(mesh.PublicKey)
+	mesh.VIP64 = mesh.NodeIDUInt(mesh.PublicKey)
+	// Based on the primary EC256 key
+	if mesh.ID == "" {
+		mesh.ID = PublicKeyBase32SHA(publicKey)
+	}
+
+	// Setting a cert also implies trusting it's signer.
+	if mesh.Cert != nil && len(mesh.Cert.Certificate) > 1 {
+		last := mesh.Cert.Certificate[len(mesh.Cert.Certificate)-1]
+
+		mesh.AddRootDER(last)
+	}
+}
+
+func (mesh *Mesh) PubID32() string {
+	return PublicKeyBase32SHA(PublicKey(mesh.leaf().PublicKey))
+}
+
+// Will init the Cert, PubID, PublicKey fields - private is in Cert.
+func (mesh *Mesh) InitSelfSigned(kty string) *Mesh {
+	if mesh.Cert != nil {
+		return mesh // got a cert
+	}
+
+	//var keyPEM, certPEM []byte
+	var tlsCert tls.Certificate
+	if kty == "ed25519" {
+		_, edpk, _ := ed25519.GenerateKey(rand.Reader)
+		tlsCert, _, _ = mesh.generateSelfSigned("ed25519", edpk, mesh.Name+"."+mesh.Domain)
+	} else if kty == "rsa" {
+		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+		tlsCert, _, _ = mesh.generateSelfSigned("rsa", priv, mesh.Name+"."+mesh.Domain)
+	} else {
+		if mesh.Priv != "" {
+			// Use pre-defined private key
+			block, _ := pem.Decode([]byte(mesh.Priv))
+			if block != nil {
+				if block.Type == "EC PRIVATE KEY" {
+					privk, _ := x509.ParseECPrivateKey(block.Bytes)
+					tlsCert, _, _ = mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
+					mesh.setTLSCertificate(&tlsCert)
+					return mesh
+				}
+			}
+		}
+		privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		tlsCert, _, _ = mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
+	}
+	mesh.setTLSCertificate(&tlsCert)
+	return mesh
+}
+
+// InitSelfSignedKey will use the private key (EC PEM) and generate a self
+// signed certificate, using the config (name.domain)
+func (mesh *Mesh) InitSelfSignedKey(kty string) error {
+	// Use pre-defined private key
+	block, _ := pem.Decode([]byte(kty))
+	if block != nil {
+		if block.Type == "EC PRIVATE KEY" {
+			privk, _ := x509.ParseECPrivateKey(block.Bytes)
+			tlsCert, _, _ := mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
+			mesh.setTLSCertificate(&tlsCert)
+			mesh.Priv = kty
+			return nil
+		}
+	}
+
+	return nil
+}
+
+func RawKeyToPrivateKey(key, pub string) *ecdsa.PrivateKey {
+	publicUncomp, _ := base64.RawURLEncoding.DecodeString(pub)
+	privateUncomp, _ := base64.RawURLEncoding.DecodeString(key)
 
 	// TODO: privateUncomp may be DER ?
 	x, y := elliptic.Unmarshal(elliptic.P256(), publicUncomp)
@@ -53,91 +152,15 @@ func (v *MeshAuth) setEC256Vapid() {
 	pubkey := ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 	pkey := ecdsa.PrivateKey{PublicKey: pubkey, D: d}
 
-	tlsCert, _, _ := v.generateSelfSigned("ec256", &pkey, "TODO")
-
-	v.SetTLSCertificate(&tlsCert)
+	return &pkey
 }
 
-// initFromCert initializes the MeshTLSConfig with the workload certificate
-// Called after a.Cert has been set - from env, self signed or via SetTLSCertificate.
-func (a *MeshAuth) initFromCert() {
-	if a.Cert == nil {
-		return
-	}
-	_, td, ns, n := a.Spiffee()
-	if a.Domain == "" {
-		a.Domain = td
-	}
-	if a.Namespace == "" {
-		a.Namespace = ns
-	}
-	if a.Name == "" {
-		a.Name = n
-	}
+func (mesh *Mesh) InitSelfSignedKeyRaw(privk crypto.PrivateKey) error {
+	tlsCert, _, _ := mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
+	mesh.setTLSCertificate(&tlsCert)
+	//mesh.Priv = kty
 
-	publicKey := a.leaf().PublicKey
-	a.PublicKey = MarshalPublicKey(publicKey)
-	if a.Priv == "" {
-		a.Priv = string(MarshalPrivateKey(a.Cert.PrivateKey))
-	}
-	a.PubID = PublicKeyBase32SHA(PublicKey(publicKey))
-
-	a.PublicKeyBase64 = base64.RawURLEncoding.EncodeToString(a.PublicKey)
-
-	if pk, ok := a.Cert.PrivateKey.(*ecdsa.PrivateKey); ok {
-		a.ec256Priv = pk.D.Bytes()
-		a.EC256Key = base64.RawURLEncoding.EncodeToString(pk.D.Bytes())
-	}
-
-	a.VIP6 = Pub2VIP(a.PublicKey)
-	a.VIP64 = a.NodeIDUInt(a.PublicKey)
-	// Based on the primary EC256 key
-	if a.ID == "" {
-		a.ID = PublicKeyBase32SHA(publicKey)
-	}
-
-	// Setting a cert also implies trusting it's signer.
-	if a.Cert != nil && len(a.Cert.Certificate) > 1 {
-		last := a.Cert.Certificate[len(a.Cert.Certificate)-1]
-
-		a.AddRootDER(last)
-	}
-}
-
-// Will init the Cert, PubID, PublicKey fields - private is in Cert.
-func (auth *MeshAuth) InitSelfSigned(kty string) *MeshAuth {
-	if auth.Cert != nil {
-		return auth // got a cert
-	}
-
-
-
-	//var keyPEM, certPEM []byte
-	var tlsCert tls.Certificate
-	if kty == "ed25519" {
-		_, edpk, _ := ed25519.GenerateKey(rand.Reader)
-		tlsCert, _, _ = auth.generateSelfSigned("ed25519", edpk, auth.Name+"."+auth.Domain)
-	} else if kty == "rsa" {
-		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
-		tlsCert, _, _ = auth.generateSelfSigned("rsa", priv, auth.Name+"."+auth.Domain)
-	} else {
-		if auth.MeshCfg.Priv != "" {
-			// Use pre-defined private key
-			block, _ := pem.Decode([]byte(auth.MeshCfg.Priv))
-			if block != nil {
-				if block.Type == "EC PRIVATE KEY" {
-					privk, _ := x509.ParseECPrivateKey(block.Bytes)
-					tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.Domain)
-					auth.SetTLSCertificate(&tlsCert)
-					return auth
-				}
-			}
-		}
-		privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		tlsCert, _, _ = auth.generateSelfSigned("ec256", privk, auth.Name+"."+auth.Domain)
-	}
-	auth.SetTLSCertificate(&tlsCert)
-	return auth
+	return nil
 }
 
 // mesh certificates - new style
@@ -224,7 +247,7 @@ func IDFromCert(c []*x509.Certificate) string {
 }
 
 // Host2ID converts a Host/:authority or path parameter hostname to a node ID.
-func (auth *MeshAuth) Host2ID(host string) string {
+func (mesh *Mesh) Host2ID(host string) string {
 	col := strings.Index(host, ".")
 	if col > 0 {
 		host = host[0:col]
@@ -237,22 +260,9 @@ func (auth *MeshAuth) Host2ID(host string) string {
 	return strings.ToUpper(host)
 }
 
-// Will Init the credentials and create an Auth object.
-//
-// This uses pilot-agent or some other platform tool creating ./var/run/secrets/istio.io/{key,cert-chain}.pem
-// or /var/run/secrets/workload-spiffe-credentials
-//func (a *MeshAuth) SetKeysDir(dir string) error {
-//	a.CertDir = dir
-//	err := a.waitAndInitFromDir()
-//	if err != nil {
-//		return err
-//	}
-//	return nil
-//}
-
 // SetCertPEM explicitly set the certificate and key. The cert will not be rotated - use a dir to reload
 // or call this function with fresh certs before it expires.
-func (a *MeshAuth) SetCertPEM(privatePEM string, chainPEMCat string) error {
+func (mesh *Mesh) SetCertPEM(privatePEM string, chainPEMCat string) error {
 	tlsCert, err := tls.X509KeyPair([]byte(chainPEMCat), []byte(privatePEM))
 	if err != nil {
 		return err
@@ -261,47 +271,47 @@ func (a *MeshAuth) SetCertPEM(privatePEM string, chainPEMCat string) error {
 		return errors.New("missing certificate")
 	}
 
-	return a.SetTLSCertificate(&tlsCert)
+	return mesh.setTLSCertificate(&tlsCert)
 }
 
-func (a *MeshAuth) SetTLSCertificate(cert *tls.Certificate) error {
-	a.Cert = cert
-	a.initFromCert()
+func (mesh *Mesh) setTLSCertificate(cert *tls.Certificate) error {
+	mesh.Cert = cert
+	mesh.initFromCert()
 	return nil
 }
 
-func (a *MeshAuth) leaf() *x509.Certificate {
-	if a.Cert == nil {
+func (mesh *Mesh) leaf() *x509.Certificate {
+	if mesh.Cert == nil {
 		return nil
 	}
-	if a.Cert.Leaf == nil {
-		a.Cert.Leaf, _ = x509.ParseCertificate(a.Cert.Certificate[0])
+	if mesh.Cert.Leaf == nil {
+		mesh.Cert.Leaf, _ = x509.ParseCertificate(mesh.Cert.Certificate[0])
 	}
-	return a.Cert.Leaf
+	return mesh.Cert.Leaf
 }
 
 // GetCertificate is typically called during handshake, both server and client.
 // "sni" will be empty for client certificates, and set for server certificates - if not set, workload id is returned.
 //
 // ctx is the handshake context - may include additional metadata about the operation.
-func (a *MeshAuth) GetCertificate(ctx context.Context, sni string) (*tls.Certificate, error) {
+func (mesh *Mesh) GetCertificate(ctx context.Context, sni string) (*tls.Certificate, error) {
 	// TODO: if host != "", allow returning DNS certs for the host.
 	// Default (and currently only impl) is to return the spiffe cert
 	// May refresh.
 	// doesn't include :5228
 	// Have cert, not expired
 	if sni == "" {
-		if a.Cert != nil {
-			if !a.leaf().NotAfter.Before(time.Now()) {
-				return a.Cert, nil
+		if mesh.Cert != nil {
+			if !mesh.leaf().NotAfter.Before(time.Now()) {
+				return mesh.Cert, nil
 			}
 		}
 
-		if a.CertDir != "" {
-			c, _, err := loadCertFromDir(a.CertDir)
+		if mesh.ConfigLocation != "" {
+			c, _, err := loadCertFromDir(mesh.ConfigLocation)
 			if err == nil {
-				if a.Cert == nil || !c.Leaf.NotAfter.Before(time.Now()) {
-					a.Cert = c
+				if mesh.Cert == nil || !c.Leaf.NotAfter.Before(time.Now()) {
+					mesh.Cert = c
 				}
 			}
 			return c, nil
@@ -309,27 +319,27 @@ func (a *MeshAuth) GetCertificate(ctx context.Context, sni string) (*tls.Certifi
 		return nil, nil
 	}
 
-	if a.CertMap == nil {
-		a.CertMap = a.GetCerts()
+	if mesh.CertMap == nil {
+		mesh.CertMap = mesh.GetCerts()
 	}
-	c, ok := a.CertMap[sni]
+	c, ok := mesh.CertMap[sni]
 	if ok {
 		return c, nil
 	}
 
-	if a.GetCertificateHook != nil {
-		c, err := a.GetCertificateHook(sni)
+	if mesh.GetCertificateHook != nil {
+		c, err := mesh.GetCertificateHook(sni)
 		if err != nil {
 			return nil, err
 		}
-		a.Cert = c
+		mesh.Cert = c
 	}
 
-	if a.Cert == nil {
+	if mesh.Cert == nil {
 		return &tls.Certificate{}, nil
 	}
 
-	return a.Cert, nil
+	return mesh.Cert, nil
 }
 
 // loadCertFromDir will attempt to read from a tlsCrt directory, attempting well-known file names
@@ -368,7 +378,7 @@ func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
 	return &tlsCert, certBytes, nil
 }
 
-//func (a *MeshAuth) waitAndInitFromDir() error {
+//func (a *Mesh) waitAndInitFromDir() error {
 //	if a.CertDir == "" {
 //		a.CertDir = "./var/run/secrets/istio.io/"
 //	}
@@ -387,30 +397,30 @@ func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
 //}
 
 // Same with initFromDir, but will repeat.
-func (a *MeshAuth) initFromDirPeriodic() {
-	err := a.initFromDir()
+func (mesh *Mesh) initFromDirPeriodic(certDir string, first bool) error {
+	err := mesh.initFromDir(certDir)
 	if err != nil {
 		log.Println("certRefresh", err)
+		if first {
+			return err
+		}
 	}
-	time.AfterFunc(30*time.Minute, a.initFromDirPeriodic)
+	time.AfterFunc(30*time.Minute, func() {
+		mesh.initFromDirPeriodic(certDir, false)
+	})
+	return nil
 }
 
-func (a *MeshAuth) initFromDirPeriodicStart() error {
-	err := a.initFromDir()
-	time.AfterFunc(30*time.Minute, a.initFromDirPeriodic)
-	return err
-}
-
-// initFromDir will Init the certificate and roots
-func (a *MeshAuth) initFromDir() error {
-	_, err := a.GetCertificate(context.Background(), "")
+// initFromDir will Init the certificate and roots from a directory
+func (mesh *Mesh) initFromDir(certDir string) error {
+	_, err := mesh.GetCertificate(context.Background(), "")
 	if err != nil {
 		return err
 	}
 
-	rootCert, _ := ioutil.ReadFile(filepath.Join(a.CertDir, "root-cert.pem"))
+	rootCert, _ := ioutil.ReadFile(filepath.Join(certDir, "root-cert.pem"))
 	if rootCert != nil {
-		err2 := a.AddRoots(rootCert)
+		err2 := mesh.AddRoots(rootCert)
 		if err2 != nil {
 			return err2
 		}
@@ -418,37 +428,37 @@ func (a *MeshAuth) initFromDir() error {
 
 	istioCert, _ := ioutil.ReadFile("./var/run/secrets/istio/root-cert.pem")
 	if istioCert != nil {
-		err2 := a.AddRoots(istioCert)
+		err2 := mesh.AddRoots(istioCert)
 		if err2 != nil {
 			return err2
 		}
 	}
 	istioCert, _ = ioutil.ReadFile("/var/run/secrets/istio/root-cert.pem")
 	if istioCert != nil {
-		err2 := a.AddRoots(istioCert)
+		err2 := mesh.AddRoots(istioCert)
 		if err2 != nil {
 			return err2
 		}
 	}
 
 	// Similar with /etc/ssl/certs/ca-certificates.crt - the concatenated list of PEM certs.
-	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, caCrt))
+	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(certDir, caCrt))
 	if rootCertExtra != nil {
-		err2 := a.AddRoots(rootCertExtra)
+		err2 := mesh.AddRoots(rootCertExtra)
 		if err2 != nil {
 			return err2
 		}
 	}
 
 	// If the certificate has a chain, use the last cert - similar with Istio
-	if a.Cert != nil && len(a.Cert.Certificate) > 1 {
-		last := a.Cert.Certificate[len(a.Cert.Certificate)-1]
+	if mesh.Cert != nil && len(mesh.Cert.Certificate) > 1 {
+		last := mesh.Cert.Certificate[len(mesh.Cert.Certificate)-1]
 
-		a.AddRootDER(last)
+		mesh.AddRootDER(last)
 	}
 
-	if a.Cert != nil {
-		a.initFromCert()
+	if mesh.Cert != nil {
+		mesh.initFromCert()
 	}
 	return nil
 }
@@ -503,7 +513,7 @@ func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
 // This creates 3 files.
 // NGinx and others also support one file, in the order cert, intermediary, key,
 // and using hostname as the name.
-func (a *MeshAuth) SaveCerts(outDir string) error {
+func (mesh *Mesh) SaveCerts(outDir string) error {
 	if outDir == "" {
 		outDir = varRunSecretsWorkloadSpiffeCredentials
 	}
@@ -515,7 +525,7 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 	}
 
 	rootsB := bytes.Buffer{}
-	for _, k := range a.RootCertificates {
+	for _, k := range mesh.RootCertificates {
 		pemb := pem.EncodeToMemory(&pem.Block{Type: blockTypeCertificate, Bytes: k})
 		rootsB.Write(pemb)
 		rootsB.Write([]byte{'\n'})
@@ -530,11 +540,11 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 	chainFile := filepath.Join(outDir, tlsCrt)
 	os.MkdirAll(outDir, 0755)
 
-	p := MarshalPrivateKey(a.Cert.PrivateKey)
+	p := MarshalPrivateKey(mesh.Cert.PrivateKey)
 
 	// TODO: full chain
 	bb := bytes.Buffer{}
-	for _, crt := range a.Cert.Certificate {
+	for _, crt := range mesh.Cert.Certificate {
 		b := pem.EncodeToMemory(
 			&pem.Block{
 				Type:  blockTypeCertificate,
@@ -576,7 +586,7 @@ func (a *MeshAuth) SaveCerts(outDir string) error {
 //
 // If envoy + pilot-agent are used, they should be configured to use the cert files.
 // This is done by setting "CA_PROVIDER=GoogleGkeWorkloadCertificate" when starting pilot-agent
-func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error {
+func (mesh *Mesh) InitCertificates(ctx context.Context, certDir string) error {
 	if certDir == "" {
 		certDir = varRunSecretsWorkloadSpiffeCredentials
 	}
@@ -588,13 +598,11 @@ func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error 
 
 	kp, err := tls.X509KeyPair(certPEM, privPEM)
 	if err == nil && len(kp.Certificate) > 0 {
-		kr.CertDir = certDir
-
 		kp.Leaf, _ = x509.ParseCertificate(kp.Certificate[0])
 
 		exp := kp.Leaf.NotAfter.Sub(time.Now())
 		if exp > -5*time.Minute {
-			kr.Cert = &kp
+			mesh.Cert = &kp
 			log.Println("Existing Cert", "expires", exp)
 			return nil
 		}
@@ -603,8 +611,8 @@ func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error 
 }
 
 // Extract the trustDomain, namespace and Name from a spiffee certificate
-func (a *MeshAuth) Spiffee() (*url.URL, string, string, string) {
-	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
+func (mesh *Mesh) Spiffee() (*url.URL, string, string, string) {
+	cert, err := x509.ParseCertificate(mesh.Cert.Certificate[0])
 	if err != nil {
 		return nil, "", "", ""
 	}
@@ -618,17 +626,17 @@ func (a *MeshAuth) Spiffee() (*url.URL, string, string, string) {
 	return nil, "", "", ""
 }
 
-func (a *MeshAuth) WorkloadID() string {
-	su, _, _, _ := a.Spiffee()
+func (mesh *Mesh) WorkloadID() string {
+	su, _, _, _ := mesh.Spiffee()
 	return su.String()
 }
 
 // String returns a json representation of mesh auth.
-func (a *MeshAuth) String() string {
-	if a.Cert == nil || len(a.Cert.Certificate) == 0 {
+func (mesh *Mesh) String() string {
+	if mesh.Cert == nil || len(mesh.Cert.Certificate) == 0 {
 		return "{}"
 	}
-	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
+	cert, err := x509.ParseCertificate(mesh.Cert.Certificate[0])
 	if err != nil {
 		return ""
 	}
@@ -642,24 +650,24 @@ func (a *MeshAuth) String() string {
 
 // Add a list of certificates in DER format to the root.
 // The top signer of the workload certificate is added by default.
-func (a *MeshAuth) AddRootDER(root []byte) error {
+func (mesh *Mesh) AddRootDER(root []byte) error {
 	rootCAs, err := x509.ParseCertificates(root)
-	a.RootCertificates = append(a.RootCertificates, root)
+	mesh.RootCertificates = append(mesh.RootCertificates, root)
 	if err == nil {
 		for _, c := range rootCAs {
-			a.trustedCertPool.AddCert(c)
-			a.meshCertPool.AddCert(c)
+			mesh.trustedCertPool.AddCert(c)
+			mesh.meshCertPool.AddCert(c)
 		}
 	}
 	return err
 }
 
 // AddRoots will process a PEM file containing multiple concatenated certificates.
-func (a *MeshAuth) AddRoots(rootCertPEM []byte) error {
+func (mesh *Mesh) AddRoots(rootCertPEM []byte) error {
 	block, rest := pem.Decode(rootCertPEM)
 	//var blockBytes []byte
 	for block != nil {
-		a.AddRootDER(block.Bytes)
+		mesh.AddRootDER(block.Bytes)
 		block, rest = pem.Decode(rest)
 	}
 	return nil
@@ -667,10 +675,10 @@ func (a *MeshAuth) AddRoots(rootCertPEM []byte) error {
 
 // GenerateTLSConfigDest returns a custom tls config for a Dest and a context holder.
 // This should be used with a single
-func (a *MeshAuth) TLSClient(ctx context.Context, nc net.Conn,
+func (mesh *Mesh) TLSClient(ctx context.Context, nc net.Conn,
 	dest *Dest,
 	remotePub32 string) (*tls.Conn, error) {
-	tlsc := tls.Client(nc, a.TLSClientConf(dest, "", remotePub32))
+	tlsc := tls.Client(nc, mesh.TLSClientConf(dest, "", remotePub32))
 
 	if err := tlsc.HandshakeContext(ctx); err != nil {
 		// if the context was canceled, return the context error
@@ -684,18 +692,21 @@ func (a *MeshAuth) TLSClient(ctx context.Context, nc net.Conn,
 }
 
 // HttpClient returns a http.Client configured based on the security settings for Dest.
-func (a *MeshAuth) HttpClient(dest *Dest) *http.Client {
-	return dest.HttpClient()
+func (mesh *Mesh) HttpClient(dest *Dest) *http.Client {
+
+	c := dest.HttpClient()
+
+	return c
 }
 
 // TLSClientConf returns a config for a specific cluster.
 //
 // sni can override the cluster sni
 // remotePub32 is the cert-baseed identity of a specific endpoint.
-func (a *MeshAuth) TLSClientConf(dest *Dest, sni string,
+func (mesh *Mesh) TLSClientConf(dest *Dest, sni string,
 	 remotePub32 string) *tls.Config {
 
-	pool := a.meshCertPool //  a.trustedCertPool
+	pool := mesh.meshCertPool //  a.trustedCertPool
 	if dest.CACertPEM != nil {
 		pool = dest.CertPool()
 	}
@@ -716,21 +727,21 @@ func (a *MeshAuth) TLSClientConf(dest *Dest, sni string,
 		RootCAs: pool,
 
 		// provide the workload cert if asked
-		Certificates:           []tls.Certificate{*a.Cert},
+		Certificates:           []tls.Certificate{*mesh.Cert},
 		NextProtos:             dest.ALPN,
 		ServerName:             sni,
 		SessionTicketsDisabled: false,
-		ClientSessionCache:     a.ClientSessionCache,
+		ClientSessionCache:     mesh.ClientSessionCache,
 
 		GetClientCertificate: func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return a.GetCertificate(cri.Context(), "")
+			return mesh.GetCertificate(cri.Context(), "")
 		},
 	}
 
 	if len(dest.URLSANs) > 0 || len(dest.DNSSANs) > 0  || remotePub32 != ""{
 		conf.InsecureSkipVerify = true
 		conf.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return a.verifyServerCert(dest, sni, rawCerts, verifiedChains, pool,
+			return mesh.verifyServerCert(dest, sni, rawCerts, verifiedChains, pool,
 				remotePub32)
 		}
 	}
@@ -757,7 +768,7 @@ as the key that signed a particular cert.
 // - certificate is valid
 // - if it has a Spiffee identity - verify it is in same namespace or istio-system
 // - else: verify it matches SNI (unless sni is empty). For DNS only will use provided pool or root certs
-func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, checked [][]*x509.Certificate, pool *x509.CertPool, remotePub32 string) error {
+func (mesh *Mesh) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, checked [][]*x509.Certificate, pool *x509.CertPool, remotePub32 string) error {
 
 	if len(checked) != 0 {
 		return nil
@@ -816,14 +827,14 @@ func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, c
 		trustDomain := c0.Host
 
 		// TODO: check aliases
-		if trustDomain != a.Domain {
+		if trustDomain != mesh.Domain {
 
-			log.Println("MTLS: invalid trust domain", trustDomain, "self", a.Domain, peerCert.URIs)
-			return errors.New("invalid trust domain " + trustDomain + " " + a.Domain)
+			log.Println("MTLS: invalid trust domain", trustDomain, "self", mesh.Domain, peerCert.URIs)
+			return errors.New("invalid trust domain " + trustDomain + " " + mesh.Domain)
 		}
 
 		if pool == nil {
-			pool = a.trustedCertPool
+			pool = mesh.trustedCertPool
 		}
 		_, err := peerCert.Verify(x509.VerifyOptions{
 			Roots:         pool,
@@ -840,7 +851,7 @@ func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, c
 		}
 
 		ns := parts[2]
-		if ns == "istio-system" || ns == a.Namespace {
+		if ns == "istio-system" || ns == mesh.Namespace {
 			return nil
 		}
 
@@ -858,7 +869,7 @@ func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, c
 			})
 			if err != nil {
 				_, err = peerCert.Verify(x509.VerifyOptions{
-					Roots:         a.trustedCertPool,
+					Roots:         mesh.trustedCertPool,
 					Intermediates: intCertPool,
 				})
 			}
@@ -918,7 +929,7 @@ func (a *MeshAuth) verifyServerCert(dest *Dest, sni string, rawCerts [][]byte, c
 	}
 }
 
-func (a *MeshAuth) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _ [][]*x509.Certificate) error {
+func (mesh *Mesh) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _ [][]*x509.Certificate) error {
 	if len(rawCerts) == 0 {
 		if allowMeshExternal {
 			return nil
@@ -949,13 +960,13 @@ func (a *MeshAuth) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _
 	}
 	c0 := peerCert.URIs[0]
 	trustDomain := c0.Host
-	if trustDomain != a.Domain {
+	if trustDomain != mesh.Domain {
 		log.Println("MTLS: invalid trust domain", trustDomain, peerCert.URIs)
-		return errors.New("invalid trust domain " + trustDomain + " " + a.Domain)
+		return errors.New("invalid trust domain " + trustDomain + " " + mesh.Domain)
 	}
 
 	_, err := peerCert.Verify(x509.VerifyOptions{
-		Roots:         a.trustedCertPool,
+		Roots:         mesh.trustedCertPool,
 		Intermediates: intCertPool,
 	})
 	if err != nil {
@@ -969,21 +980,21 @@ func (a *MeshAuth) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _
 	}
 
 	ns := parts[2]
-	if ns == "istio-system" || ns == a.Namespace {
+	if ns == "istio-system" || ns == mesh.Namespace {
 		return nil
 	}
 
 	// TODO: also validate namespace is same with this workload or in list of namespaces ?
-	if len(a.AllowedNamespaces) == 0 {
+	if len(mesh.AllowedNamespaces) == 0 {
 		log.Println("MTLS: namespace not allowed", peerCert.URIs)
 		return errors.New("Namespace not allowed")
 	}
 
-	if a.AllowedNamespaces[0] == "*" {
+	if mesh.AllowedNamespaces[0] == "*" {
 		return nil
 	}
 
-	for _, ans := range a.AllowedNamespaces {
+	for _, ans := range mesh.AllowedNamespaces {
 		if ns == ans {
 			return nil
 		}
@@ -1000,14 +1011,14 @@ func (a *MeshAuth) verifyClientCert(allowMeshExternal bool, rawCerts [][]byte, _
 //
 // If allowMeshExternal is set, will skip verification for certs with different
 // trust domain.
-func (a *MeshAuth) GenerateTLSConfigServer(allowMeshExternal bool) *tls.Config {
+func (mesh *Mesh) GenerateTLSConfigServer(allowMeshExternal bool) *tls.Config {
 	// TODO: setting to allow use of public CAs for server checking clients
 	return &tls.Config{
 		//MinVersion: tls.VersionTLS13,
 		//PreferServerCipherSuites: ugate.preferServerCipherSuites(),
 		InsecureSkipVerify: true,                  // This is not insecure here. We will verify the cert chain ourselves.
 		ClientAuth:         tls.RequestClientCert, // not require - we'll fallback to JWT
-		ClientCAs:          a.meshCertPool,
+		ClientCAs:          mesh.meshCertPool,
 		GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			// Will only be called if client supplies SNI and Certificates empty
 			// Requested ALPN info is lost after handshake.
@@ -1019,12 +1030,12 @@ func (a *MeshAuth) GenerateTLSConfigServer(allowMeshExternal bool) *tls.Config {
 
 			// Serve the requested cert if a SNI name is present and we have
 			// a cert. Else serve the workload cert.
-			return a.GetCertificate(ch.Context(), ch.ServerName)
+			return mesh.GetCertificate(ch.Context(), ch.ServerName)
 		},
 
 		// Will check the peer certificate, using the trust roots.
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return a.verifyClientCert(allowMeshExternal, rawCerts, verifiedChains)
+			return mesh.verifyClientCert(allowMeshExternal, rawCerts, verifiedChains)
 		},
 
 		NextProtos: []string{"istio", "h2"},
@@ -1032,13 +1043,13 @@ func (a *MeshAuth) GenerateTLSConfigServer(allowMeshExternal bool) *tls.Config {
 }
 
 // Generate and save the primary self-signed Certificate
-func (auth *MeshAuth) generateSelfSigned(prefix string, priv crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
-	return auth.SignCert(priv, priv, sans...)
+func (mesh *Mesh) generateSelfSigned(prefix string, priv crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
+	return mesh.SignCert(priv, priv, sans...)
 }
 
-func (auth *MeshAuth) SignCert(priv crypto.PrivateKey, ca crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
+func (mesh *Mesh) SignCert(priv crypto.PrivateKey, ca crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
 	pub := PublicKey(priv)
-	certDER := auth.SignCertDER(pub, ca, sans...)
+	certDER := mesh.SignCertDER(pub, ca, sans...)
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
 	ecb, _ := x509.MarshalPKCS8PrivateKey(priv)
@@ -1051,7 +1062,7 @@ func (auth *MeshAuth) SignCert(priv crypto.PrivateKey, ca crypto.PrivateKey, san
 	return tlsCert, keyPEM, certPEM
 }
 
-func (auth *MeshAuth) SignCertDER(pub crypto.PublicKey, caPrivate crypto.PrivateKey, sans ...string) []byte {
+func (mesh *Mesh) SignCertDER(pub crypto.PublicKey, caPrivate crypto.PrivateKey, sans ...string) []byte {
 	var notBefore time.Time
 	notBefore = time.Now().Add(-1 * time.Hour)
 
@@ -1064,7 +1075,7 @@ func (auth *MeshAuth) SignCertDER(pub crypto.PublicKey, caPrivate crypto.Private
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   sans[0],
-			Organization: []string{auth.Domain},
+			Organization: []string{mesh.Domain},
 		},
 		NotBefore: notBefore,
 		NotAfter:  notAfter,
@@ -1092,8 +1103,8 @@ func (auth *MeshAuth) SignCertDER(pub crypto.PublicKey, caPrivate crypto.Private
 
 var useED = false
 
-func (auth *MeshAuth) NodeID() []byte {
-	return auth.VIP6[8:]
+func (mesh *Mesh) NodeID() []byte {
+	return mesh.VIP6[8:]
 }
 
 var (
@@ -1118,8 +1129,8 @@ func Pub2VIP(pub []byte) net.IP {
 
 // Return the self identity. Currently it's using the VIP6 format - may change.
 // This is used in Message 'From' and in ReqContext.
-func (a *MeshAuth) Self() string {
-	return a.VIP6.String()
+func (mesh *Mesh) Self() string {
+	return mesh.VIP6.String()
 }
 
 // Generate a 8-byte identifier from a public key
@@ -1135,12 +1146,12 @@ func Pub2ID(pub []byte) uint64 {
 	}
 }
 
-func (auth *MeshAuth) NodeIDUInt(pub []byte) uint64 {
+func (mesh *Mesh) NodeIDUInt(pub []byte) uint64 {
 	return Pub2ID(pub)
 }
 
 // OIDC discovery on .well-known/openid-configuration
-func (a *MeshAuth) HandleDisc(w http.ResponseWriter, r *http.Request) {
+func (mesh *Mesh) HandleDisc(w http.ResponseWriter, r *http.Request) {
 	// Issuer must match the hostname used to connect.
 	//
 	w.Header().Set("content-type", "application/json")
@@ -1168,13 +1179,51 @@ func (a *MeshAuth) HandleDisc(w http.ResponseWriter, r *http.Request) {
 	// TODO: switch to EdDSA
 }
 
+
+const (
+	blockTypeECPrivateKey      = "EC PRIVATE KEY"
+	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#1 private key
+	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
+	blockTypeCertificate     = "CERTIFICATE"
+)
+
+func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
+	if k, ok := key.(ed25519.PrivateKey); ok {
+		return k.Public()
+	}
+	if k, ok := key.(*ecdsa.PrivateKey); ok {
+		return k.Public()
+	}
+	if k, ok := key.(*rsa.PrivateKey); ok {
+		return k.Public()
+	}
+
+	return nil
+}
+
+
+// PrivatePEM returns the private key, as PEM
+func (mesh *Mesh) PrivatePEM() (privPEM []byte) {
+	var encodedKey []byte
+	switch k := mesh.Cert.PrivateKey.(type) {
+	case *rsa.PrivateKey:
+		encodedKey = x509.MarshalPKCS1PrivateKey(k)
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
+	case *ecdsa.PrivateKey:
+		encodedKey, _ = x509.MarshalECPrivateKey(k)
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+	}
+	return
+}
+
+
 // Sign - requires ECDSA primary key
-func (auth *MeshAuth) Sign(data []byte, sig []byte) {
+func (mesh *Mesh) Sign(data []byte, sig []byte) {
 	hasher := crypto.SHA256.New()
 	hasher.Write(data) //[0:64]) // only public key, for debug
 	hash := hasher.Sum(nil)
 
-	c0 := auth.Cert
+	c0 := mesh.Cert
 	if ec, ok := c0.PrivateKey.(*ecdsa.PrivateKey); ok {
 		r, s, _ := ecdsa.Sign(rand.Reader, ec, hash)
 		copy(sig, r.Bytes())
@@ -1254,7 +1303,7 @@ func GetSAN(c *x509.Certificate) ([]string, error) {
 // lego certificates and istio.
 //
 // "istio" is a special name, set if istio certs are found
-func (auth *MeshAuth) GetCerts() map[string]*tls.Certificate {
+func (mesh *Mesh) GetCerts() map[string]*tls.Certificate {
 	certMap := map[string]*tls.Certificate{}
 
 	if _, err := os.Stat("./etc/certs/key.pem"); !os.IsNotExist(err) {

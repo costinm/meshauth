@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/costinm/meshauth"
+	"github.com/costinm/meshauth/pkg/oidc"
 )
 
 // TokenExchangeD is an OAuth2 token exchange server, RFC8694 -(extending RFC6749
@@ -23,7 +24,7 @@ import (
 //
 // It can returns access_token and JWT tokens.
 type TokenExchangeD struct {
-	Authn    *meshauth.Authn
+	Authn    *oidc.Authn
 	Generate func(context.Context, *meshauth.JWT, string) (string, error)
 }
 

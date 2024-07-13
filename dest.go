@@ -1,18 +1,16 @@
 package meshauth
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/costinm/meshauth/pkg/apis/authn"
 )
 
 /*
@@ -57,7 +55,7 @@ and perform advanced client-side Init balancing and routing.
 // address or IP:port that is either captured or set as backendRef in routes.
 type Dest struct {
 
-	// Addr is the address of the destination.
+	// Addr is the main (VIP or URL) address of the destination.
 	//
 	// For HTTP, Addr is the URL, including any required path prefix, for the destination.
 	//
@@ -84,20 +82,58 @@ type Dest struct {
 	// Only set for (frontend) Services. Used when capturing traffic for this service
 	//
 	//VIP []string `json:"alpn,omitempty"`
+	// MeshCluster WorkloadID - the cluster name in kube config, hub, gke - cluster name in XDS
+	// Defaults to Base addr - but it is possible to have multiple clusters for
+	// same address ( ex. different users / token providers).
+	//
+	// Examples:
+	// GKE cluster: gke_PROJECT_LOCATION_NAME
+	//
+	// For mesh nodes:
+	// ID is the (best) primary id known for the node. Format is:
+	//    base32(SHA256(EC_256_pub)) - 32 bytes binary, 52 bytes encoded
+	//    base32(ED_pub) - same size, for nodes with ED keys.
+	//
+	// For non-mesh nodes, it is a (real) domain name or IP if unknown.
+	// It may include port, or even be a URL - the external destinations may
+	// have different public keys on different ports.
+	//
+	// The node may be a virtual IP ( ex. K8S/Istio service ) or name
+	// of a virtual service.
+	//
+	// If IPs are used, they must be either truncated SHA or included
+	// in the node cert or the control plane must return metadata and
+	// secure low-level network is used (like wireguard)
+	//
+	// Required for secure communication.
+	//
+	// Examples:
+	//  -  [B32_SHA]
+	//  -  [B32_SHA].reviews.bookinfo.svc.example.com
+	//  -  IP6 (based on SHA or 'trusted' IP)
+	//  -  IP4 ('trusted' IP)
+	//
+	// IPFS:
+	// http://<gateway host>/ipfs/CID/path
+	// http://<cid>.ipfs.<gateway host>/<path>
+	// http://gateway/ipns/IPNDS_ID/path
+	// ipfs://<CID>/<path>, ipns://<peer WorkloadID>/<path>, and dweb://<IPFS address>
+	//
+	// Multiaddr: TLV
+	ID string `json:"id,omitempty"`
 
 
 	// Sources of trust for validating the peer destination.
 	// Typically, a certificate - if not set, SYSTEM certificates will be used for non-mesh destinations
 	// and the MESH certificates for destinations using one of the mesh domains.
 	// If not set, the nodes' trust config is used.
-	TrustConfig *TrustConfig `json:"trust,omitempty"`
+	TrustConfig *authn.TrustConfig `json:"trust,omitempty"`
 
 	// Expected SANs - if not set, the DNS host in the address is used.
 	// For mesh FQDNs, the namespace will be checked ( second part of the FQDN )
 	DNSSANs []string `json:"dns_san,omitempty"`
 	//IPSANs  []string `json:"ip_san,omitempty"`
 	URLSANs []string `json:"url_san,omitempty"`
-
 	// SNI to use when making the request. Defaults to hostname in Addr
 	SNI string `json:"sni,omitempty"`
 
@@ -107,12 +143,13 @@ type Dest struct {
 	Location string `json:"location,omitempty"`
 
 	// If empty, the cluster is using system certs or SPIFFE CAs - as configured in
-	// MeshAuth.
+	// Mesh.
 	//
 	// Otherwise, it's the configured root certs list, in PEM format.
 	// May include multiple concatenated roots.
 	//
 	// TODO: allow root SHA only.
+	// TODO: move to trust config
 	CACertPEM []byte `json:"ca_cert,omitempty"`
 
 	// From CDS
@@ -183,38 +220,40 @@ type Dest struct {
 
 	Backoff time.Duration `json:"-"`
 	Dynamic bool `json:"-"`
+
+	// Hosts are workload addresses associated with the backend service.
+	//
+	// If empty, the MeshCluster Addr will be used directly - it is expected to be
+	// a FQDN or VIP that is routable - either a service backed by an LB or handled by
+	// ambient or K8S.
+	//
+	// This may be pre-configured or result of discovery (IPs, extra properties).
+	Hosts []*Host `json:"hosts,omitempty"`
 }
 
-// ContextGetter allows getting a Context associated with a stream or
-// request or other high-level object. Based on http.Request
-type ContextGetter interface {
-	Context() context.Context
+
+// Host represents the properties of a single workload.
+// By default, clusters resolve the endpoints dynamically, using DNS or EDS or other
+// discovery mechanisms.
+type Host struct {
+	// Labels for the workload. Extracted from pod info - possibly TXT records
+	//
+	// 'hbone' can be used for a custom hbone endpoint (default 15008).
+	//
+	Labels map[string]string `json:"labels,omitempty"`
+
+	//LBWeight int `json:"lb_weight,omitempty"`
+	//Priority int
+
+	// Address is an IP where the host can be reached.
+	// It can be a real IP (in the mesh, direct) or a jump host.
+	//
+	Address string `json:"addr,omitempty"`
+
+	// FQDN of the host. Used to check host cert.
+	Hostname string
 }
 
-
-
-// ContextDialer is same with x.net.proxy.ContextDialer
-// Used to create the actual connection to an address using the mesh.
-// The result may have metadata, and be an instance of util.Stream.
-//
-// A uGate implements this interface, it is the primary interface
-// for creating streams where the caller does not want to pass custom
-// metadata. Based on net and addr and handshake, if destination is
-// capable we will upgrade to BTS and pass metadata. This may also
-// be sent via an egress gateway.
-//
-// For compatibility, 'net' can be "tcp" and addr a mangled hostname:port
-// Mesh addresses can be identified by the hostname or IP6 address.
-// External addresses will create direct connections if possible, or
-// use egress server.
-//
-// TODO: also support 'url' scheme
-type ContextDialer interface {
-	// Dial with a context based on tls package - 'once successfully
-	// connected, any expiration of the context will not affect the
-	// connection'.
-	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
-}
 
 // HttpClient returns a http client configured to talk with this Dest using a secure connection.
 // - if CACertPEM is set, will be used instead of system
@@ -252,15 +291,17 @@ func (d *Dest) HttpClient() *http.Client {
 		}
 	}
 
+
 	return d.httpClient
 }
+
 
 func (d *Dest) RoundTrip(r *http.Request) (*http.Response, error) {
 	return d.HttpClient().Do(r)
 }
 
 // WIP
-func (d *Dest) DialTLS(a *MeshAuth, nc net.Conn) (*tls.Conn, error) {
+func (d *Dest) DialTLS(a *Mesh, nc net.Conn) (*tls.Conn, error) {
 	tlsClientConfig := a.TLSClientConf(d, d.SNI, d.Addr)
 	tlsTun := tls.Client(nc, tlsClientConfig)
 	ctx, cf := context.WithTimeout(context.Background(), 3 * time.Second)
@@ -274,6 +315,7 @@ func (d *Dest) DialTLS(a *MeshAuth, nc net.Conn) (*tls.Conn, error) {
 	return tlsTun, nil
 }
 
+// TODO: add a DialTLSContext using DNS-SEC for Cert SHA, as well as a direct CERT-SHA
 
 func (d *Dest) GetCACertPEM() []byte {
 	return d.CACertPEM
@@ -281,9 +323,9 @@ func (d *Dest) GetCACertPEM() []byte {
 
 // AddToken will add a token to the request, using the 'token source' of the
 // destination.
-func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
-	if c.TokenSource != "" {
-		tp := ma.AuthProviders[c.TokenSource]
+func (d *Dest) AddToken(ma *Mesh, req *http.Request, aut string) error {
+	if d.TokenSource != "" {
+		tp := ma.AuthProviders[d.TokenSource]
 		if tp != nil {
 			t, err := tp.GetToken(req.Context(), aut)
 			if err != nil {
@@ -292,8 +334,8 @@ func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
 			req.Header.Add("authorization", "Bearer "+t)
 		}
 	}
-	if c.TokenProvider != nil {
-		t, err := c.TokenProvider.GetToken(req.Context(), aut)
+	if d.TokenProvider != nil {
+		t, err := d.TokenProvider.GetToken(req.Context(), aut)
 		if err != nil {
 			return err
 		}
@@ -303,21 +345,15 @@ func (c *Dest) AddToken(ma *MeshAuth, req *http.Request, aut string) error {
 		//}
 	}
 
-	// TODO: use default workload identity token source for MeshAuth
+	// TODO: use default workload identity token source for Mesh
 
 	return nil
 }
 
-type tokenSourceFunc func(ctx context.Context, aut string) (string, error)
-
-func (f tokenSourceFunc) GetToken(ctx context.Context, aut string) (string, error) {
-	return f(ctx, aut)
-}
-
-func (c *Dest) TokenGetter(ma *MeshAuth) TokenSource {
-	return tokenSourceFunc(func(ctx context.Context, aut string) (string, error) {
-		if c.TokenSource != "" {
-			tp := ma.AuthProviders[c.TokenSource]
+func (d *Dest) TokenGetter(m *Mesh) TokenSource {
+	return TokenSourceFunc(func(ctx context.Context, aut string) (string, error) {
+		if d.TokenSource != "" {
+			tp := m.AuthProviders[d.TokenSource]
 			if tp != nil {
 				t, err := tp.GetToken(ctx, aut)
 				if err != nil {
@@ -326,15 +362,15 @@ func (c *Dest) TokenGetter(ma *MeshAuth) TokenSource {
 				return t, nil
 			}
 		}
-		if c.TokenProvider != nil {
-			t, err := c.TokenProvider.GetToken(ctx, aut)
+		if d.TokenProvider != nil {
+			t, err := d.TokenProvider.GetToken(ctx, aut)
 			if err != nil {
 				return "", err
 			}
 			return t, nil
 		}
 
-		// TODO: use default workload identity token source for MeshAuth
+		// TODO: use default workload identity token source for Mesh
 		return "", nil
 	})
 }
@@ -370,104 +406,87 @@ func (d *Dest) AddCACertPEM(pems []byte) error {
 
 // Helpers for making REST and K8S requests for a k8s-like API.
 
-// RESTRequest is a REST or K8S style request. Will be used with a Dest.
-//
-// It is based on/inspired from kelseyhightower/konfig - which uses the 'raw'
-// K8S protocol to avoid a big dependency. Google, K8S and many other APIs have
-// a raw representation and don't require complex client libraries and depdencies.
-// No code generation or protos are used - raw JSON in []byte is used, caller
-// can handle marshalling.
-//
-// Close to K8S raw REST client - but without the builder style.
-type RESTRequest struct {
-	Method    string
-	Namespace string
-	Kind      string
-	Name      string
 
-	Body []byte
-
-	// If set, will be added at the end (must include ?). For example ?watch=0
-	Query string
+func (d *Dest) BackoffReset() {
+	d.Backoff = 0
 }
 
-func (kr *RESTRequest) HttpRequest(ctx context.Context, d *Dest) *http.Request {
-	var path string
-	if kr.Namespace != "" {
-		path = fmt.Sprintf("/api/v1/namespaces/%s/%ss", kr.Namespace, kr.Kind)
-	} else {
-		path = "/apis/" + kr.Kind
+func (d *Dest) BackoffSleep() {
+	if d.Backoff == 0 {
+		d.Backoff = 5 * time.Second
 	}
-	if kr.Name != "" { // else - list request
-		path = path + "/" + kr.Name
+	time.Sleep(d.Backoff)
+	if d.Backoff < 5*time.Minute {
+		d.Backoff = d.Backoff * 2
 	}
-	if kr.Query != "" {
-		path = path + kr.Query
-	}
-
-	var req *http.Request
-	m := kr.Method
-	if kr.Method == "" {
-		if kr.Body == nil {
-			m = "GET"
-		} else {
-			m = "POST"
-		}
-	}
-	if kr.Body == nil {
-		req, _ = http.NewRequestWithContext(ctx, m, d.Addr+path, nil)
-	} else {
-		req, _ = http.NewRequestWithContext(ctx, m, d.Addr+path, bytes.NewReader(kr.Body))
-	}
-
-	req.Header.Add("content-type", "application/json")
-
-	if d.TokenProvider != nil {
-		t, err := d.TokenProvider.GetToken(ctx, d.Addr)
-		if err == nil {
-			req.Header.Add("authorization", "Bearer "+t)
-		}
-	}
-	return req
-
-}
-
-// Load will populate the Secret object from a K8S-like service.
-// This also works with real K8S.
-//
-// 'kind' can be 'configmap', 'secret', etc for using K8S-style URL format
-func (d *Dest) Load(ctx context.Context, obj interface{}, kind, ns string, name string) error {
-	rr := &RESTRequest{
-		Namespace: ns,
-		Kind:      kind,
-		Name:      name,
-	}
-
-	res, err := d.HttpClient().Do(rr.HttpRequest(ctx, d))
-	if err != nil {
-		return err
-	}
-
-	data, err := io.ReadAll(res.Body)
-	err = json.Unmarshal(data, obj)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 
-func (n *Dest) BackoffReset() {
-	n.Backoff = 0
+// GetDest returns a cluster for the given address, or nil if not found.
+func (mesh *Mesh) GetDest(addr string) *Dest {
+	mesh.m.RLock()
+	c := mesh.Dst[addr]
+	// Make sure it is set correctly.
+	if c != nil && c.ID == "" {
+		c.ID = addr
+	}
+
+	mesh.m.RUnlock()
+	return c
 }
 
-func (n *Dest) BackoffSleep() {
-	if n.Backoff == 0 {
-		n.Backoff = 5 * time.Second
+
+// Cluster will get an existing cluster or create a dynamic one.
+// Dynamic clusters can be GC and loaded on-demand.
+func (mesh *Mesh) GetOrAddDest(ctx context.Context, addr string) (*Dest, error) {
+	// TODO: extract cluster from addr, allow URL with params to indicate how to connect.
+	//host := ""
+	//if strings.Contains(dest, "//") {
+	//	u, _ := url.Parse(dest)
+	//
+	//	host, _, _ = net.SplitHostPort(u.Host)
+	//} else {
+	//	host, _, _ = net.SplitHostPort(dest)
+	//}
+	//if strings.HasSuffix(host, ".svc") {
+	//	hc.H2Gate = hg + ":15008" // hbone/mtls
+	//	hc.ExternalMTLSConfig = auth.GenerateTLSConfigServer()
+	//}
+	//// Initialization done - starting the proxy either on a listener or stdin.
+
+	// 1. Find the cluster for the address. If not found, create one with the defaults or use on-demand
+	// if XDS server is configured
+	mesh.m.RLock()
+	c, ok := mesh.Dst[addr]
+	mesh.m.RUnlock()
+
+	// TODO: use discovery to find info about service addr, populate from XDS on-demand or DNS
+	if !ok {
+		// TODO: on-demand, DNS lookups, etc
+		c = &Dest{Addr: addr, Dynamic: true, ID: addr}
+		mesh.addDest(c)
 	}
-	time.Sleep(n.Backoff)
-	if n.Backoff < 5*time.Minute {
-		n.Backoff = n.Backoff * 2
+	//c.LastUsed = time.Now()
+	return c, nil
+}
+
+// addDest will add a cluster to be used for Dial and RoundTrip.
+// The 'Addr' field can be a host:port or IP:port.
+// If id is set, it can be host:port or hostname - will be added as a destination.
+// The service can be IP:port or URLs
+func (mesh *Mesh) addDest(c *Dest) *Dest {
+	mesh.m.Lock()
+	mesh.Dst[c.Addr] = c
+
+	if c.ID != "" {
+		mesh.Dst[c.ID] = c
 	}
+
+	//c.UGate = hb
+	//if c.ConnectTimeout == 0 {
+	//	c.ConnectTimeout = hb.Auth.ConnectTimeout.Duration
+	//}
+	mesh.m.Unlock()
+
+	return c
 }

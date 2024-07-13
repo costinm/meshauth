@@ -22,16 +22,20 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 )
 
-// From nodeagent/plugin/providers/google/stsclient
-// In Istio, the code was used if "GoogleCA" is set as CA_PROVIDER or CA_ADDR has the right prefix
+// STS client for token exchange.
+// Typical usage is to use a K8S token with a special audience, and exchange it for a google tokens.
 
 // The STS protocol is standard - this file has defaults for Google URLs.
+// Initially based on Istio nodeagent/plugin/providers/google/stsclient
+// In Istio, the code was used if "GoogleCA" is set as CA_PROVIDER or CA_ADDR has the right prefix
+
 
 var (
 	// secureTokenEndpoint is the Endpoint the STS client calls to.
@@ -105,9 +109,6 @@ type STSAuthConfig struct {
 	// Federated tokens also require cluster info.
 	GCPDelegate bool
 
-	// UseAccessToken forces return of access tokens for google, even if 'aud' is set
-	// Access tokens are returned by default for googleapis.com audiences.
-	UseAccessToken bool
 }
 
 // STS provides token exchanges (RFC8694).
@@ -146,43 +147,46 @@ func NewFederatedTokenSource(kr *STSAuthConfig) *STS {
 	}
 }
 
-func ToMeta(t string) map[string]string {
-	res := map[string]string{
-		"authorization": "Bearer " + t,
-	}
-	return res
-}
-
 // GetToken for STS returns an access token if aud is empty.
 func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
 	var federatedAccessToken string
 	var err error
+	var kt string
 
 	if s.cfg.GCPDelegate {
-		// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
+		// Directly get the access token from the parent - no exchange needed, usually the prent is ADC or MDS.
+		// The token may be a federated token on GKE - or an access token on GCP.
 		federatedAccessToken, err = s.cfg.TokenSource.GetToken(ctx, "")
 		if err != nil {
 			return "", err
 		}
 	} else {
 		// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
-		kt, err := s.cfg.TokenSource.GetToken(ctx, s.cfg.AudienceSource)
+		kt, err = s.cfg.TokenSource.GetToken(ctx, s.cfg.AudienceSource)
 		if err != nil {
+			slog.Info("STS failed to get K8S token", "err", err, "fedaud", s.cfg.AudienceSource)
 			return "", err
 		}
 
 		// Federated token - a google access token equivalent with the k8s JWT, using STS
 		federatedAccessToken, err = s.exchangeK8SJWT2FederatedAccessToken(ctx, kt, aud)
 		if err != nil {
+			slog.Info("STS failed to get fed access token", "err", err, "fedaud", s.cfg.AudienceSource, "aud", aud)
 			return "", err
 		}
-
 	}
 	// TODO: read from file as well - if TokenSource is not set for example.
 
 	if s.cfg.GSA != "" {
 		// GCP special config - the token exchange can't delegate, so a 3rd roundtrip is needed
-		return s.TokenGSA(ctx, federatedAccessToken, aud)
+		t, err := s.TokenGSA(ctx, federatedAccessToken, aud)
+		if err != nil {
+			jwt := DecodeJWT(kt)
+
+			slog.Info("STS failed use fed access token for GSA", "err", err, "fedaud", s.cfg.AudienceSource, "gsa", s.cfg.GSA, "jwt", jwt)
+
+		}
+		return t, err
 	}
 
 	return federatedAccessToken, nil
@@ -303,7 +307,8 @@ func (s *STS) constructFederatedTokenRequest(aud, jwt string) ([]byte, error) {
 
 // TokenResponse stores all attributes sent as JSON in a successful STS
 // response. These attributes are defined in RFC8693 2.2.1
-// Also RFC6749 5.1
+// Also RFC6749 5.1 and https://tools.ietf.org/html/draft-ietf-oauth-token-exchange-16#section-2.2.1
+// Also used by the MDS.
 type TokenResponse struct {
 	// REQUIRED. The security token issued by the authorization server
 	// in response to the token exchange request.
@@ -338,6 +343,33 @@ type Duration struct {
 	// 60 sec/min * 60 min/hr * 24 hr/day * 365.25 days/year * 10000 years
 	Seconds int64 `json:"seconds"`
 }
+
+//func (ms Duration) MarshalJSON() ([]byte, error) {
+//	return json.Marshal(ms.String())
+//}
+//
+//func (ms *Duration) UnmarshalJSON(data []byte) error {
+//	var v interface{}
+//	if err := json.Unmarshal(data, &v); err != nil {
+//		return err
+//	}
+//	switch value := v.(type) {
+//	case float64:
+//		*ms = Duration{Duration: time.Duration(value)}
+//		return nil
+//	case string:
+//		var err error
+//		s, err := time.ParseDuration(value)
+//		if err != nil {
+//			return err
+//		}
+//		*ms = Duration{Duration: s}
+//		return nil
+//	default:
+//		return errors.New("invalid duration")
+//	}
+//}
+
 
 // Exchange a federated token equivalent with the k8s JWT with the ASM p4SA.
 // TODO: can be used with any GSA, if the permission to call generateAccessToken is granted.
@@ -376,10 +408,10 @@ type Duration struct {
 //
 // The p4sa is auto-setup for all authenticated users in ASM.
 func (s *STS) TokenGSA(ctx context.Context, federatedToken string, audience string) (string, error) {
-	accessToken := audience == "" || s.cfg.UseAccessToken ||
+	accessToken := audience == ""  ||
 		strings.Contains(audience, "googleapis.com")
 
-	req, err := s.newGCPGenerateTokenRequest(ctx, federatedToken, audience, accessToken)
+	req, err := s.iamServiceAccountGenerate(ctx, federatedToken, audience, accessToken)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal federated token request: %v", err)
 	}
@@ -405,7 +437,7 @@ func (s *STS) TokenGSA(ctx context.Context, federatedToken string, audience stri
 
 		if respData.AccessToken == "" {
 			return "", fmt.Errorf(
-				"exchanged empty token, response: %v", string(body))
+				"Failed to get GSA access token from federated access token GSA=%s, response: %v", s.cfg.GSA, string(body))
 		}
 
 		return respData.AccessToken, nil
@@ -462,13 +494,13 @@ var (
 	gcpServiceAccountEndpointJWT    = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateIdToken"
 )
 
-// newGCPGenerateTokenRequest implements the 'generateAccessToken' protocol for google service accounts.
+// iamServiceAccountGenerate implements the 'generateAccessToken' protocol for google service accounts.
 //
 // 'sourceToken' is a federated token ( can be another google access token, if the permissions are set).
 //
 // https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
 // https://oauth2.googleapis.com/token - with refresh_token
-func (s *STS) newGCPGenerateTokenRequest(ctx context.Context, sourceToken string, audience string, accessToken bool) (*http.Request, error) {
+func (s *STS) iamServiceAccountGenerate(ctx context.Context, sourceToken string, audience string, accessToken bool) (*http.Request, error) {
 	gsa := s.cfg.GSA
 	endpoint := ""
 	var err error
