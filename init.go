@@ -3,6 +3,7 @@ package meshauth
 import (
 	"context"
 	"errors"
+	"github.com/costinm/meshauth/pkg/apis/authn"
 	"log"
 	"log/slog"
 	"net"
@@ -265,29 +266,74 @@ func (mesh *Mesh) MainEnd() {
 // If a cert is not found, Cert field will be nil, and the app should
 // use one of the methods of getting a cert or call InitSelfSigned.
 func FromEnv(ctx context.Context, cfg *MeshCfg, base string) (*Mesh, error) {
-	ma, err := New(cfg).FromEnv(ctx, base)
+	ma := New(cfg)
+	err := ma.FromEnv(ctx, base)
 
 	return ma, err
 }
 
+type InitFromEnv interface {
+	FromEnv(ctx context.Context, base string) error
+}
+
 // FromEnv will initialize Mesh using local files and env variables.
 //
-func (mesh *Mesh) FromEnv(ctx context.Context, base string) (*Mesh, error) {
+func (mesh *Mesh) FromEnv(ctx context.Context, base string) (error) {
 
 	cfg := mesh.MeshCfg
+
+	// Detect cloudrun
+	ks := os.Getenv("K_SERVICE")
+	if ks != "" {
+		sn := ks
+		verNsName := strings.SplitN(ks, "--", 2)
+		if len(verNsName) > 1 {
+			sn = verNsName[1]
+		}
+		mesh.Name = sn
+		mesh.AuthnConfig.Issuers = append(mesh.AuthnConfig.Issuers,
+			&authn.TrustConfig{
+				Issuer: "https://accounts.google.com",
+			})
+	}
+
+	// Determine the workload name, using environment variables or hostname.
+	// This should be unique, typically pod-xxx-yyy
 
 	// Merge a found config and env variables.
 	mesh.Get(base, cfg)
 
 	if mesh.Name == "" {
-		mesh.Name = workloadName()
+		name := os.Getenv("POD_NAME")
+		if name == "" {
+			name = os.Getenv("WORKLOAD_NAME")
+		}
+		mesh.Name = name
 	}
+
+	if mesh.Name == "" {
+		name, _ := os.Hostname()
+		if strings.Contains(name, ".") {
+			parts := strings.SplitN(name, ".", 2)
+			mesh.Name = parts[0]
+			if mesh.Domain == "" {
+				mesh.Domain = parts[1]
+			}
+		} else {
+			mesh.Name = name
+		}
+	}
+
+	if mesh.Domain == "" {
+		mesh.Domain = "mesh.internal"
+	}
+
 
 	// Attempt to locate existing workload certs from the cert dir.
 	// TODO: attempt to get certs from an agent.
 	if mesh.Cert == nil {
 		if cfg.ConfigLocation == "-" {
-			return mesh, nil
+			return nil
 		}
 		certDir := cfg.ConfigLocation
 		if certDir == "" {
@@ -304,35 +350,9 @@ func (mesh *Mesh) FromEnv(ctx context.Context, base string) (*Mesh, error) {
 		}
 
 		if certDir != "" {
-			return mesh, mesh.initFromDirPeriodic(certDir, true)
+			return mesh.initFromDirPeriodic(certDir, true)
 		}
 	}
 
-	return mesh, nil
-}
-
-
-// Determine the workload name, using environment variables or hostname.
-// This should be unique, typically pod-xxx-yyy
-func workloadName() string {
-	name := os.Getenv("POD_NAME")
-	if name == "" {
-		name = os.Getenv("WORKLOAD_NAME")
-	}
-	if name != "" {
-		return name
-	}
-	ks := os.Getenv("K_SERVICE")
-	if ks != "" {
-		verNsName := strings.SplitN(ks, "--", 2)
-		if len(verNsName) > 1 {
-			return verNsName[1]
-			//kr.Labels["ver"] = verNsName[0]
-		} else {
-			return ks
-		}
-	}
-	name, _ = os.Hostname()
-	// TODO: split and extract namespace
-	return name
+	return nil
 }

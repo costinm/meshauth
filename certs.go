@@ -47,6 +47,10 @@ import (
 //    it will do a TLS handshake anyway and RoundTripStart can implement TLS for the outer tunnel.
 
 
+// Certificate is DER encoded stuct containing a []byte, algorithm (oid) and
+// BitString signature ([]byte, first is padding len).
+//
+
 // initFromCert initializes the MeshTLSConfig with the workload certificate
 // Called after a.Cert has been set.
 func (mesh *Mesh) initFromCert() {
@@ -124,9 +128,9 @@ func (mesh *Mesh) InitSelfSigned(kty string) *Mesh {
 	return mesh
 }
 
-// InitSelfSignedKey will use the private key (EC PEM) and generate a self
+// InitSelfSignedFromPEMKey will use the private key (EC PEM) and generate a self
 // signed certificate, using the config (name.domain)
-func (mesh *Mesh) InitSelfSignedKey(kty string) error {
+func (mesh *Mesh) InitSelfSignedFromPEMKey(kty string) error {
 	// Use pre-defined private key
 	block, _ := pem.Decode([]byte(kty))
 	if block != nil {
@@ -1214,24 +1218,6 @@ func (mesh *Mesh) PrivatePEM() (privPEM []byte) {
 		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
 	}
 	return
-}
-
-
-// Sign - requires ECDSA primary key
-func (mesh *Mesh) Sign(data []byte, sig []byte) {
-	hasher := crypto.SHA256.New()
-	hasher.Write(data) //[0:64]) // only public key, for debug
-	hash := hasher.Sum(nil)
-
-	c0 := mesh.Cert
-	if ec, ok := c0.PrivateKey.(*ecdsa.PrivateKey); ok {
-		r, s, _ := ecdsa.Sign(rand.Reader, ec, hash)
-		copy(sig, r.Bytes())
-		copy(sig[32:], s.Bytes())
-	} else if ed, ok := c0.PrivateKey.(ed25519.PrivateKey); ok {
-		sig1, _ := ed.Sign(rand.Reader, hash, nil)
-		copy(sig, sig1)
-	}
 }
 
 var (

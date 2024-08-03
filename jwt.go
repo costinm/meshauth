@@ -367,6 +367,40 @@ func jwsSign(key crypto.Signer, hash crypto.Hash, digest []byte) ([]byte, error)
 	return nil, ErrUnsupportedKey
 }
 
+// Return the crypt.Signer interface for the private key.
+func SignerFromKey(key crypto.PrivateKey) crypto.Signer {
+	switch k := key.(type) {
+	case *ecdsa.PrivateKey: return k
+	case *rsa.PrivateKey: return k
+	case ed25519.PrivateKey: return k
+	}
+	return nil
+}
+
+// Sign - requires ECDSA primary key
+func (mesh *Mesh) Sign(data []byte, sig []byte) {
+	hasher := crypto.SHA256.New()
+	hasher.Write(data) //[0:64]) // only public key, for debug
+	hash := hasher.Sum(nil)
+
+	c0 := mesh.Cert
+
+	if ec, ok := c0.PrivateKey.(*ecdsa.PrivateKey); ok {
+		// Not the ASN.1 signature
+		r, s, _ := ecdsa.Sign(rand.Reader, ec, hash)
+		copy(sig, r.Bytes())
+		copy(sig[32:], s.Bytes())
+	} else if ed, ok := c0.PrivateKey.(ed25519.PrivateKey); ok {
+		sig1, _ := ed.Sign(rand.Reader, hash, nil)
+		copy(sig, sig1)
+	} else {
+		signer := SignerFromKey(mesh.Cert.PrivateKey)
+		sig1, _ := signer.Sign(rand.Reader, hash, crypto.SHA256)
+		copy(sig, sig1)
+	}
+}
+
+
 var 	ErrUnsupportedKey = errors.New("unknown key type; only RSA and ECDSA are supported")
 
 

@@ -102,6 +102,8 @@ type MeshCfg struct {
 
 	// Timeout used for TLS or SSH handshakes. If not set, 3 seconds is used.
 	HandsahakeTimeout time.Duration
+
+	Env map[string]string
 }
 
 
@@ -198,7 +200,6 @@ type Mesh struct {
 
 	// Private key. UGate primary key is EC256, in PEM format.
 	// Used for client and server auth for all protocols.
-	// If not set, will be loaded from ConfigLocation tls.key file, or auto-generated.
 	// Deprecated - method to get it from Cert.
 	Priv string `json:"priv,omitempty"`
 
@@ -322,6 +323,10 @@ func New(cfg *MeshCfg) *Mesh {
 // GetRaw will look in all config sources associated with the mesh
 // and attempt to locate the config.
 func (mesh *Mesh) GetRaw(base string, suffix string) []byte {
+	env := mesh.Env[base]
+	if env != "" {
+		return []byte(env)
+	}
 
 	basecfg := os.Getenv(base)
 	if basecfg != "" {
@@ -344,12 +349,6 @@ func (mesh *Mesh) GetRaw(base string, suffix string) []byte {
 	}
 
 	fb, err = os.ReadFile("/" + base + "/" + base + suffix)
-	if err == nil {
-		return fb
-	}
-
-	// Also look in the .ssh directory - this is mainly for secrets.
-	fb, err = os.ReadFile(os.Getenv("HOME") + "/.ssh/" + base + suffix)
 	if err == nil {
 		return fb
 	}
