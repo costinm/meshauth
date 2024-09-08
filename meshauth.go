@@ -4,12 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
-	"log"
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -106,11 +103,23 @@ type MeshCfg struct {
 	Env map[string]string
 }
 
-
+// Deprecated
 func (m *Mesh) Module(name string) *Module {
 	for _, mm := range m.Modules {
 		if mm.Name == name {
 			return mm
+		}
+	}
+	return nil
+}
+
+
+func ModuleT[T interface{}](m *Mesh, name string) *T {
+	for _, mm := range m.Modules {
+		if mm.Name == name {
+			//*res = mm.Module.(T)
+			tt :=  mm.Module.(*T)
+			return tt
 		}
 	}
 	return nil
@@ -196,7 +205,7 @@ type Mesh struct {
 	// Primary workload ID TLS certificate and private key. Loaded or generated.
 	// Default is to use EC256 certs. The private key can be used to sign JWTs.
 	// The public key and sha can be used as a node identity.
-	Cert *tls.Certificate
+	Cert *tls.Certificate `json:-`
 
 	// Private key. UGate primary key is EC256, in PEM format.
 	// Used for client and server auth for all protocols.
@@ -354,37 +363,6 @@ func (mesh *Mesh) GetRaw(base string, suffix string) []byte {
 	}
 
 	return nil
-}
-
-// Get finds a config in a store, applies the environ overlay and unmarshalls it.
-// 'base' is the base name for the config - corresponds to GVK in K8S.
-func (mesh *Mesh) Get(base string, out interface{}) error {
-	suffix := ".json"
-
-	basecfg := FindConfig(base, suffix)
-	if basecfg != nil {
-		err := json.Unmarshal([]byte(basecfg), out)
-		if err !=  nil {
-			return err
-		}
-	}
-
-	// Quick hack to load environment variables into the config struct.
-	envl := os.Environ()
-	envm := map[string]string{}
-	for _, k := range envl {
-		kv := strings.SplitN(k, "=", 2)
-		if len(kv) == 2 {
-			envm[kv[0]] = kv[1]
-		}
-	}
-	envb, err := json.Marshal(envm)
-	if err != nil {
-		log.Println("Failed to overlay env", envl, err, envb)
-		return err
-	}
-
-	return json.Unmarshal(envb, out)
 }
 
 

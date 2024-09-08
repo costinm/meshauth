@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package meshauth
+package stsd
 
 import (
 	"bytes"
@@ -27,6 +27,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+
+	"github.com/costinm/meshauth"
 )
 
 // STS client for token exchange.
@@ -57,7 +59,7 @@ type STSAuthConfig struct {
 	//
 	// For GKE - the audience should be PROJECT.svc.id.goog.
 	// Can be a file source when running in K8S, if the token is mounted.
-	TokenSource TokenSource
+	TokenSource meshauth.TokenSource
 
 	// AudienceSource to use when getting tokens from TokenSource.
 	// On GKE: fleet_project_name.svc.id.goog
@@ -181,7 +183,7 @@ func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
 		// GCP special config - the token exchange can't delegate, so a 3rd roundtrip is needed
 		t, err := s.TokenGSA(ctx, federatedAccessToken, aud)
 		if err != nil {
-			jwt := DecodeJWT(kt)
+			jwt := meshauth.DecodeJWT(kt)
 
 			slog.Info("STS failed use fed access token for GSA", "err", err, "fedaud", s.cfg.AudienceSource, "gsa", s.cfg.GSA, "jwt", jwt)
 
@@ -200,7 +202,7 @@ func (s *STS) exchangeK8SJWT2FederatedAccessToken(ctx context.Context, subjectTo
 
 	if s.cfg.ClusterAddress == "" {
 		// First time - construct it from the K8S token
-		j := DecodeJWT(subjectToken)
+		j := meshauth.DecodeJWT(subjectToken)
 		if j == nil {
 			return "", errors.New("Invalid jwt")
 		}
@@ -535,7 +537,7 @@ func (s *STS) iamServiceAccountGenerate(ctx context.Context, sourceToken string,
 		return nil, fmt.Errorf("failed to create get access token request: %+v", err)
 	}
 	req.Header.Add("Content-Type", "application/json")
-	if Debug {
+	if meshauth.Debug {
 		reqDump, _ := httputil.DumpRequest(req, true)
 		log.Println("Prepared access token request: ", string(reqDump))
 	}

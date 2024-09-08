@@ -3,24 +3,9 @@ package meshauth
 import (
 	"context"
 	"errors"
-	"log"
 	"net"
 	"net/http"
 )
-
-// UDPHandler is used to abstract the handling of incoming UDP packets on a UDP
-// listener or TUN.
-type UDPHandler interface {
-	HandleUdp(dstAddr net.IP, dstPort uint16, localAddr net.IP, localPort uint16, data []byte)
-}
-
-// UdpWriter is the interface implemented by the TunTransport, to send
-// packets back to the virtual interface. TUN or TProxy raw support this.
-// Required for 'transparent' capture of UDP - otherwise use STUN/TURN/etc.
-// A UDP NAT does not need this interface.
-type UdpWriter interface {
-	WriteTo(data []byte, dstAddr *net.UDPAddr, srcAddr *net.UDPAddr) (int, error)
-}
 
 
 
@@ -79,14 +64,14 @@ func (mesh *Mesh) DialContext(ctx context.Context, network, addr string) (net.Co
 	return nc, err
 }
 
-
-// HandleUdp is the common entry point for UDP capture.
-// - tproxy
-// - gvisor/lwIP
-// WIP
-func (ug *Mesh) HandleUdp(dstAddr net.IP, dstPort uint16,
-		localAddr net.IP, localPort uint16,
-		data []byte) {
-	log.Println("TProxy UDP ", dstAddr, dstPort, localAddr, localPort, len(data))
-}
+//
+//// HandleUdp is the common entry point for UDP capture.
+//// - tproxy
+//// - gvisor/lwIP
+//// WIP
+//func (ug *Mesh) HandleUdp(dstAddr net.IP, dstPort uint16,
+//		localAddr net.IP, localPort uint16,
+//		data []byte) {
+//	log.Println("TProxy UDP ", dstAddr, dstPort, localAddr, localPort, len(data))
+//}
 

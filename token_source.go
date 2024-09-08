@@ -14,11 +14,6 @@ import (
 // mds.go implements a GCP-like HTTP token and metadata source.
 // pkg/webpush/vapid implements a VAPID token source - but returns the full header, not just the token
 
-// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
-type TokenSource interface {
-	// GetToken for a given audience.
-	GetToken(context.Context, string) (string, error)
-}
 
 type TokenSourceFunc func(context.Context, string) (string, error)
 

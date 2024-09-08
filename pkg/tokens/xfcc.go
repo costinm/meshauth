@@ -1,4 +1,4 @@
-package xfcc
+package tokens
 
 import "strings"
 

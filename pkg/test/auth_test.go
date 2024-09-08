@@ -12,16 +12,15 @@ import (
 	"github.com/costinm/meshauth/pkg/apis/authn"
 	"github.com/costinm/meshauth/pkg/ca"
 	"github.com/costinm/meshauth/pkg/mdsd"
-	"github.com/costinm/meshauth/pkg/oidc"
 	"github.com/costinm/meshauth/pkg/stsd"
-	"github.com/costinm/meshauth/pkg/xfcc"
+	"github.com/costinm/meshauth/pkg/tokens"
 )
 
 func TestJWKS(t *testing.T) {
 	ctx := context.Background()
 
 	// Init the CA - this normally runs on a remote server with ACME certs.
-	ca := ca.NewCA(nil)
+	ca := ca.NewCA()
 	err := ca.Init("../../testdata/ca")
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +44,7 @@ func TestJWKS(t *testing.T) {
 			//},
 		},
 	}
-	ja := oidc.NewAuthn(cfg)
+	ja := tokens.NewAuthn(cfg)
 
 	l := &authn.TrustConfig{
 		Issuer: "http://" + laddr,
@@ -66,7 +65,7 @@ func TestJWKS(t *testing.T) {
 	defer cf()
 
 	// Will get K8S tokens to authenticate, with istio-ca audience
-	stsc := meshauth.NewFederatedTokenSource(&meshauth.STSAuthConfig{
+	stsc := stsd.NewFederatedTokenSource(&stsd.STSAuthConfig{
 		STSEndpoint: "http://" + laddr + "/v1/token",
 		TokenSource: &CATokenSource{CA: ca, Sub: "test", Iss: "http://ca"}, // def.NewK8STokenSource("istio-ca"),
 		AudienceSource: "istio-ca",
@@ -118,7 +117,7 @@ func startServer(t *testing.T, ca *ca.CA, mauth *meshauth.Mesh) string {
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	addr := fmt.Sprintf("localhost:%s", p)
 
-	authn := oidc.NewAuthn(&authn.AuthnConfig{
+	authn := tokens.NewAuthn(&authn.AuthnConfig{
 		Issuers: []*authn.TrustConfig{
 			&authn.TrustConfig{
 				Issuer: "http://" + addr,
@@ -168,7 +167,7 @@ func checkJWT(t *testing.T, jwt string) {
 
 	cfg.Issuers = []*authn.TrustConfig{{Issuer: "https://accounts.google.com"}}
 
-	ja := oidc.NewAuthn(cfg)
+	ja := tokens.NewAuthn(cfg)
 
 	// May use a custom method too with lower deps
 	//ja.Verify = oidc.Verify
@@ -179,7 +178,7 @@ func checkJWT(t *testing.T, jwt string) {
 	}
 }
 func TestXFCC(t *testing.T) {
-	vals := xfcc.ParseXFCC(`By=spiffe://cluster.local/ns/ssh-ca/sa/default;Hash=8813da93b;Subject="";URI=spiffe://cluster.local/ns/sshd/sa/default`)
+	vals := tokens.ParseXFCC(`By=spiffe://cluster.local/ns/ssh-ca/sa/default;Hash=8813da93b;Subject="";URI=spiffe://cluster.local/ns/sshd/sa/default`)
 	if vals["By"] != "spiffe://cluster.local/ns/ssh-ca/sa/default" {
 		t.Error("Missing By")
 	}

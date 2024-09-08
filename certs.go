@@ -13,8 +13,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/asn1"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
@@ -31,6 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/costinm/meshauth/pkg/certs"
 )
 
 // Certificates are typically used with TLS and mTLS, but the key is the primary
@@ -69,7 +69,7 @@ func (mesh *Mesh) initFromCert() {
 	}
 
 	publicKey := mesh.leaf().PublicKey
-	mesh.PublicKey = MarshalPublicKey(publicKey)
+	mesh.PublicKey = certs.MarshalPublicKey(publicKey)
 	if mesh.Priv == "" {
 		mesh.Priv = string(MarshalPrivateKey(mesh.Cert.PrivateKey))
 	}
@@ -100,6 +100,8 @@ func (mesh *Mesh) InitSelfSigned(kty string) *Mesh {
 		return mesh // got a cert
 	}
 
+
+
 	//var keyPEM, certPEM []byte
 	var tlsCert tls.Certificate
 	if kty == "ed25519" {
@@ -109,18 +111,6 @@ func (mesh *Mesh) InitSelfSigned(kty string) *Mesh {
 		priv, _ := rsa.GenerateKey(rand.Reader, 2048)
 		tlsCert, _, _ = mesh.generateSelfSigned("rsa", priv, mesh.Name+"."+mesh.Domain)
 	} else {
-		if mesh.Priv != "" {
-			// Use pre-defined private key
-			block, _ := pem.Decode([]byte(mesh.Priv))
-			if block != nil {
-				if block.Type == "EC PRIVATE KEY" {
-					privk, _ := x509.ParseECPrivateKey(block.Bytes)
-					tlsCert, _, _ = mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
-					mesh.setTLSCertificate(&tlsCert)
-					return mesh
-				}
-			}
-		}
 		privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		tlsCert, _, _ = mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
 	}
@@ -128,17 +118,24 @@ func (mesh *Mesh) InitSelfSigned(kty string) *Mesh {
 	return mesh
 }
 
+func (mesh *Mesh) InitSelfSignedKeyRaw(privk crypto.PrivateKey) error {
+	tlsCert, _, _ := mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
+	mesh.setTLSCertificate(&tlsCert)
+	//mesh.Priv = kty
+
+	return nil
+}
+
 // InitSelfSignedFromPEMKey will use the private key (EC PEM) and generate a self
 // signed certificate, using the config (name.domain)
-func (mesh *Mesh) InitSelfSignedFromPEMKey(kty string) error {
+func (mesh *Mesh) InitSelfSignedFromPEMKey(keyPEM string) error {
 	// Use pre-defined private key
-	block, _ := pem.Decode([]byte(kty))
+	block, _ := pem.Decode([]byte(keyPEM))
 	if block != nil {
 		if block.Type == "EC PRIVATE KEY" {
 			privk, _ := x509.ParseECPrivateKey(block.Bytes)
 			tlsCert, _, _ := mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
 			mesh.setTLSCertificate(&tlsCert)
-			mesh.Priv = kty
 			return nil
 		}
 	}
@@ -157,14 +154,6 @@ func RawKeyToPrivateKey(key, pub string) *ecdsa.PrivateKey {
 	pkey := ecdsa.PrivateKey{PublicKey: pubkey, D: d}
 
 	return &pkey
-}
-
-func (mesh *Mesh) InitSelfSignedKeyRaw(privk crypto.PrivateKey) error {
-	tlsCert, _, _ := mesh.generateSelfSigned("ec256", privk, mesh.Name+"."+mesh.Domain)
-	mesh.setTLSCertificate(&tlsCert)
-	//mesh.Priv = kty
-
-	return nil
 }
 
 // mesh certificates - new style
@@ -197,7 +186,7 @@ var base32Enc = base32.StdEncoding.WithPadding(base32.NoPadding)
 // --------------- Helpers and methods --------------
 
 // PublicKeyBase32SHA returns a node WorkloadID based on the
-// public key of the node - 52 bytes base32.
+// public key of the node - 52 bytes base32 for EC256 keys
 func PublicKeyBase32SHA(key crypto.PublicKey) string {
 	m := MarshalPublicKey(key)
 	if len(m) > 32 {
@@ -209,46 +198,6 @@ func PublicKeyBase32SHA(key crypto.PublicKey) string {
 	return base32Enc.EncodeToString(m)
 }
 
-// Return the SPKI fingerprint of the key
-// https://www.rfc-editor.org/rfc/rfc7469#section-2.4
-//
-// Can be used with "ignore-certificate-errors-spki-list" in chrome
-//
-//	openssl x509 -pubkey -noout -in <path to PEM cert> | openssl pkey -pubin -outform der \
-//	  | openssl dgst -sha256 -binary | openssl base32Enc -base64
-//
-// sha256/BASE64
-func SPKIFingerprint(key crypto.PublicKey) string {
-	// pubDER, err := x509.MarshalPKIXPublicKey(c.PublicKey.(*rsa.PublicKey))
-	d := MarshalPublicKey(key)
-	sum := sha256.Sum256(d)
-	pin := make([]byte, base64.StdEncoding.EncodedLen(len(sum)))
-	base64.StdEncoding.Encode(pin, sum[:])
-	return string(pin)
-}
-
-func IDFromPublicKeyBytes(m []byte) string {
-	if len(m) > 32 {
-		sha256 := sha256.New()
-		sha256.Write(m)
-		m = sha256.Sum([]byte{}) // 302
-	}
-	return base32Enc.EncodeToString(m)
-}
-
-func IDFromCert(c []*x509.Certificate) string {
-	if c == nil || len(c) == 0 {
-		return ""
-	}
-	key := c[0].PublicKey
-	m := MarshalPublicKey(key)
-	if len(m) > 32 {
-		sha256 := sha256.New()
-		sha256.Write(m)
-		m = sha256.Sum([]byte{}) // 302
-	}
-	return base32Enc.EncodeToString(m)
-}
 
 // Host2ID converts a Host/:authority or path parameter hostname to a node ID.
 func (mesh *Mesh) Host2ID(host string) string {
@@ -351,20 +300,12 @@ func (mesh *Mesh) GetCertificate(ctx context.Context, sni string) (*tls.Certific
 //
 // Because it is not possible to get back the tlsCrt bytes from tlsCrt, return it as well.
 func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
-	// SetCert cert from file
-	keyFile := filepath.Join(dir, "key.pem")
+	keyFile := filepath.Join(dir, tlsKey)
 	keyBytes, err := ioutil.ReadFile(keyFile)
-	if err != nil {
-		keyFile = filepath.Join(dir, tlsKey)
-		keyBytes, err = ioutil.ReadFile(keyFile)
-	}
 	if err != nil {
 		return nil, nil, err
 	}
-	certBytes, err := ioutil.ReadFile(filepath.Join(dir, "cert-chain.pem"))
-	if err != nil {
-		certBytes, err = ioutil.ReadFile(filepath.Join(dir, tlsCrt))
-	}
+	certBytes, err := ioutil.ReadFile(filepath.Join(dir, tlsCrt))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -377,7 +318,6 @@ func loadCertFromDir(dir string) (*tls.Certificate, []byte, error) {
 	if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
 		return nil, nil, errors.New("missing certificate")
 	}
-	tlsCert.Leaf, _ = x509.ParseCertificate(tlsCert.Certificate[0])
 
 	return &tlsCert, certBytes, nil
 }
@@ -467,49 +407,9 @@ func (mesh *Mesh) initFromDir(certDir string) error {
 	return nil
 }
 
-// Convert a PublicKey to a marshalled format - in the raw format.
-// - 32 byte ED25519
-// - 65 bytes EC256 ( 0x04 prefix )
-// - DER RSA key (PKCS1)
-//
-// Normally the key is available from request or response TLS.PeerCertificate[0]
-func MarshalPublicKey(key crypto.PublicKey) []byte {
-	if k, ok := key.(ed25519.PublicKey); ok {
-		return []byte(k)
-	}
-	if k, ok := key.(*ecdsa.PublicKey); ok {
-		return elliptic.Marshal(elliptic.P256(), k.X, k.Y)
-		// starts with 0x04 == uncompressed curve
-	}
-	if k, ok := key.(*rsa.PublicKey); ok {
-		bk := x509.MarshalPKCS1PublicKey(k)
-		return bk
-	}
-	if k, ok := key.([]byte); ok {
-		if len(k) == 64 || len(k) == 32 {
-			return k
-		}
-	}
+var MarshalPublicKey = certs.MarshalPublicKey
 
-	return nil
-}
-
-// MarshalPrivateKey returns the PEM encoding of the key
-func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
-	switch k := priv.(type) {
-	case *rsa.PrivateKey:
-		encodedKey := x509.MarshalPKCS1PrivateKey(k)
-		return pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
-	case *ecdsa.PrivateKey:
-		encodedKey, _ := x509.MarshalECPrivateKey(k)
-		return pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
-	case ed25519.PrivateKey:
-		// TODO: what is the std encoding for ed25529 ?
-		return []byte(base64.RawURLEncoding.EncodeToString(k))
-	}
-
-	return nil
-}
+var MarshalPrivateKey = certs.MarshalPrivateKey
 
 // SaveCerts will create certificate files as expected by gRPC and Istio, similar with the
 // auto-created files.
@@ -1048,64 +948,11 @@ func (mesh *Mesh) GenerateTLSConfigServer(allowMeshExternal bool) *tls.Config {
 
 // Generate and save the primary self-signed Certificate
 func (mesh *Mesh) generateSelfSigned(prefix string, priv crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
-	return mesh.SignCert(priv, priv, sans...)
-}
-
-func (mesh *Mesh) SignCert(priv crypto.PrivateKey, ca crypto.PrivateKey, sans ...string) (tls.Certificate, []byte, []byte) {
-	pub := PublicKey(priv)
-	certDER := mesh.SignCertDER(pub, ca, sans...)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	ecb, _ := x509.MarshalPKCS8PrivateKey(priv)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: ecb})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		log.Println("Error generating cert ", err)
+	c := &certs.Cert{
+		Org: mesh.Domain,
 	}
-	return tlsCert, keyPEM, certPEM
+	return c.SignCert(priv, priv, sans...)
 }
-
-func (mesh *Mesh) SignCertDER(pub crypto.PublicKey, caPrivate crypto.PrivateKey, sans ...string) []byte {
-	var notBefore time.Time
-	notBefore = time.Now().Add(-1 * time.Hour)
-
-	notAfter := notBefore.Add(365 * 24 * time.Hour)
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName:   sans[0],
-			Organization: []string{mesh.Domain},
-		},
-		NotBefore: notBefore,
-		NotAfter:  notAfter,
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              sans,
-		//IPAddresses:           []net.IP{auth.VIP6},
-	}
-	// IPFS:
-	//certKeyPub, err := x509.MarshalPKIXPublicKey(certKey.Public())
-	//signature, err := sk.Sign(append([]byte(certificatePrefix), certKeyPub...))
-	//value, err := asn1.Marshal(signedKey{
-	//	PubKey:    keyBytes,
-	//	Signature: signature,
-	//})
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, caPrivate)
-	if err != nil {
-		panic(err)
-	}
-	return certDER
-}
-
-var useED = false
 
 func (mesh *Mesh) NodeID() []byte {
 	return mesh.VIP6[8:]
@@ -1191,99 +1038,8 @@ const (
 	blockTypeCertificate     = "CERTIFICATE"
 )
 
-func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
-	if k, ok := key.(ed25519.PrivateKey); ok {
-		return k.Public()
-	}
-	if k, ok := key.(*ecdsa.PrivateKey); ok {
-		return k.Public()
-	}
-	if k, ok := key.(*rsa.PrivateKey); ok {
-		return k.Public()
-	}
+var PublicKey = certs.PublicKey
 
-	return nil
-}
-
-
-// PrivatePEM returns the private key, as PEM
-func (mesh *Mesh) PrivatePEM() (privPEM []byte) {
-	var encodedKey []byte
-	switch k := mesh.Cert.PrivateKey.(type) {
-	case *rsa.PrivateKey:
-		encodedKey = x509.MarshalPKCS1PrivateKey(k)
-		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
-	case *ecdsa.PrivateKey:
-		encodedKey, _ = x509.MarshalECPrivateKey(k)
-		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
-	}
-	return
-}
-
-var (
-	oidExtensionSubjectAltName = []int{2, 5, 29, 17}
-)
-
-const (
-	nameTypeEmail = 1
-	nameTypeDNS   = 2
-	nameTypeURI   = 6
-	nameTypeIP    = 7
-)
-
-func getSANExtension(c *x509.Certificate) []byte {
-	for _, e := range c.Extensions {
-		if e.Id.Equal(oidExtensionSubjectAltName) {
-			return e.Value
-		}
-	}
-	return nil
-}
-
-func GetSAN(c *x509.Certificate) ([]string, error) {
-	extension := getSANExtension(c)
-	dns := []string{}
-	// RFC 5280, 4.2.1.6
-
-	// SubjectAltName ::= GeneralNames
-	//
-	// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
-	//
-	// GeneralName ::= CHOICE {
-	//      otherName                       [0]     OtherName,
-	//      rfc822Name                      [1]     IA5String,
-	//      dNSName                         [2]     IA5String,
-	//      x400Address                     [3]     ORAddress,
-	//      directoryName                   [4]     Name,
-	//      ediPartyName                    [5]     EDIPartyName,
-	//      uniformResourceIdentifier       [6]     IA5String,
-	//      iPAddress                       [7]     OCTET STRING,
-	//      registeredID                    [8]     OBJECT IDENTIFIER }
-	var seq asn1.RawValue
-	rest, err := asn1.Unmarshal(extension, &seq)
-	if err != nil {
-		return dns, err
-	} else if len(rest) != 0 {
-		return dns, errors.New("x509: trailing data after X.509 extension")
-	}
-	if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
-		return dns, asn1.StructuralError{Msg: "bad SAN sequence"}
-	}
-
-	rest = seq.Bytes
-	for len(rest) > 0 {
-		var v asn1.RawValue
-		rest, err = asn1.Unmarshal(rest, &v)
-		if err != nil {
-			return dns, err
-		}
-
-		if v.Tag == nameTypeDNS {
-			dns = append(dns, string(v.Bytes))
-		}
-	}
-	return dns, nil
-}
 
 // Get all known certificates from local files. This is used to support
 // lego certificates and istio.
@@ -1327,6 +1083,8 @@ func (mesh *Mesh) GetCerts() map[string]*tls.Certificate {
 	return certMap
 }
 
+var GetSAN=certs.GetSAN
+
 func RawToCertChain(rawCerts [][]byte) ([]*x509.Certificate, error) {
 	chain := make([]*x509.Certificate, len(rawCerts))
 	for i := 0; i < len(rawCerts); i++ {
@@ -1339,49 +1097,4 @@ func RawToCertChain(rawCerts [][]byte) ([]*x509.Certificate, error) {
 	return chain, nil
 }
 
-// VerifySelfSigned verifies the certificate chain and extract the remote's public key.
-func VerifySelfSigned(chain []*x509.Certificate) (crypto.PublicKey, error) {
-	if chain == nil || len(chain) == 0 {
-		return nil, nil
-	}
-
-	leaf := chain[0]
-
-	// Self-signed certificate
-	if len(chain) == 1 {
-		pool := x509.NewCertPool()
-		pool.AddCert(leaf)
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
-			// If we return an x509 error here, it will be sent on the wire.
-			// Wrap the error to avoid that.
-			return nil, fmt.Errorf("certificate verification failed: %s", err)
-		}
-	} else {
-		//
-		pool := x509.NewCertPool()
-		pool.AddCert(chain[len(chain)-1])
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
-			// If we return an x509 error here, it will be sent on the wire.
-			// Wrap the error to avoid that.
-			return nil, fmt.Errorf("chain certificate verification failed: %s", err)
-		}
-	}
-
-	// IPFS uses a key embedded in a custom extension, and verifies the public key of the leaf is signed
-	// with the node public key
-
-	// This transport is instead based on standard certs/TLS
-
-	key := leaf.PublicKey
-	if ec, ok := key.(*ecdsa.PublicKey); ok {
-		return ec, nil
-	}
-	if rsak, ok := key.(*rsa.PublicKey); ok {
-		return rsak, nil
-	}
-	if ed, ok := key.(ed25519.PublicKey); ok {
-		return ed, nil
-	}
-
-	return nil, errors.New("unknown public key")
-}
+var VerifySelfSigned = certs.VerifyChain

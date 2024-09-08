@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/meshauth/pkg/oidc"
+	"github.com/costinm/meshauth/pkg/tokens"
 )
 
 // Handler wraps another handler with authn and authz functions.
@@ -22,7 +22,7 @@ type AuthHandlerWrapper struct {
 	Handler http.Handler
 
 	// Authn function
-	Auth *oidc.Authn
+	Auth *tokens.Authn
 
 	// The wrapper will use this to log events and errors.
 	Logger *slog.Logger
@@ -46,7 +46,7 @@ func NewAuthHandler(mesh *meshauth.Mesh, mux *http.ServeMux) http.Handler {
 // Entry point for H1, H2 - will delegate to the real handler after authenticating.
 // Also keeps track of the request time and logs the request.
 func (h *AuthHandlerWrapper) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	actx := &oidc.AuthContext{
+	actx := &meshauth.RequestContext{
 		Context: request.Context(),
 
 		Start: time.Now(),

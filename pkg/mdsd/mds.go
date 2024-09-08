@@ -175,7 +175,7 @@ func NewMDSClient(ma *meshauth.Mesh, mdsBase string) *MDS {
 	}
 
 	// Load a cached value
-	ma.Get("mds", mds.meta)
+	meshauth.FindConfig("mds", mds.meta)
 
 	return mds
 }

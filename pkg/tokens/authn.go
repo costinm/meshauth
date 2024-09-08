@@ -1,4 +1,4 @@
-package oidc
+package tokens
 
 import (
 	"bytes"
@@ -101,66 +101,9 @@ func NewAuthn(cfg *authn.AuthnConfig) *Authn {
 	return an
 }
 
-
-// AuthContext is a Context implementation holding auth info for a request.
-type AuthContext struct {
-	// Workload auth config
-	MeshAuth *meshauth.Mesh
-
-	// Parent
-	Context context.Context
-
-	// Slog
-	Logger *slog.Logger
-
-	Start time.Time
-
-	// Metrics/Tracing
-
-	// Auth info for this context
-	Client string
-	Peer   string
-
-	JWTs []*meshauth.JWT
-	// Original IP and metadata.
-}
-
-func (a *AuthContext) Deadline() (deadline time.Time, ok bool) {
-	return a.Context.Deadline()
-}
-
-func (a *AuthContext) Done() <-chan struct{} {
-	return a.Context.Done()
-}
-
-func (a *AuthContext) Err() error {
-	return a.Context.Err()
-}
-
-// Value may return the AuthContext, if chained - or one of the fields.
-// Otherwise will pass to parent.
-func (a *AuthContext) Value(key any) any {
-	if key == ContextKey {
-		return a
-	}
-	return a.Context.Value(key)
-}
-
-const ContextKey = "meshAuth"
-
-func WithContext(ctx context.Context, ma *meshauth.Mesh) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	// WithValue is a struct holding the key and value (any), passing to next context.
-	// AuthContext holds multiple things in a map.
-	return &AuthContext{MeshAuth: ma, Context: ctx}
-	// instead of return context.WithValue(ctx, ContextKey, ma)
-}
-
 // Authn extracts credentials from request, applies the authn Rules to extact claims and
 // sets the result in headers and context.
-func (jauthn *Authn) Auth(actx *AuthContext, r *http.Request) error {
+func (jauthn *Authn) Auth(actx *meshauth.RequestContext, r *http.Request) error {
 	a := r.Header["Authorization"]
 	if len(a) == 0 {
 		return nil
@@ -176,7 +119,6 @@ func (jauthn *Authn) Auth(actx *AuthContext, r *http.Request) error {
 			return err
 		}
 
-		actx.JWTs = append(actx.JWTs, jt)
 		if jt.Email != "" {
 			actx.Client = jt.Email
 		} else {
@@ -189,12 +131,6 @@ func (jauthn *Authn) Auth(actx *AuthContext, r *http.Request) error {
 		// Old experiment, not using it now.
 	//} else if strings.HasPrefix(rawa, "vapid") {
 	//	tok, pub, err := CheckVAPID(rawa, time.Now())
-	//	if err != nil {
-	//		return err
-	//	}
-	//	r.Header["X-VAPID-Pub"] = []string{string(pub)}
-	//	r.Header["X-VAPID-Sub"] = []string{tok.Sub}
-	//
 	}
 	return nil
 }

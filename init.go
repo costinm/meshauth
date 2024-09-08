@@ -2,8 +2,8 @@ package meshauth
 
 import (
 	"context"
-	"errors"
-	"github.com/costinm/meshauth/pkg/apis/authn"
+	"encoding/json"
+	"expvar"
 	"log"
 	"log/slog"
 	"net"
@@ -16,20 +16,26 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/costinm/meshauth/pkg/apis/authn"
 )
 
 // Mesh initialization
 
+// Module and expvar.
+// To reduce dependencies and size, all module builders should be registered and retrieved from the expvar registry ( and
+// possibly other places).
+
+
 
 // Module is a component providing a specific functionality, similar to a
-// .so file in traditional servers. In many cases it provides a listener
+// .so file in traditional servers for mesh. In many cases it provides a listener
 // or dialer or some other service.
 //
 // Usually a protocol implementation, callbacks, etc.
 // This allows a 'modular monolith' approach and avoids deps.
 // The Module is an instance of a module with a specific name and set of
 // key/value settings.
-//
 // TODO: why not support .so files and dynamic load ?
 type Module struct {
 	Name string `json:"name"`
@@ -57,7 +63,11 @@ type Module struct {
 
 	// The module native interface.
 	Module interface{} `json:"-"`
+}
 
+func (m *Module) String() string {
+	b, _ := json.Marshal(m)
+	return string(b)
 }
 
 type Starter interface {
@@ -102,12 +112,22 @@ var modInit = map[string]func(*Module) error{}
 // or from main(). The actual implementation should be in a separate package.
 func Register(name string, template func(*Module) error) {
 	modInit[name] = template
+
+	AddKnownType[Module](name, func(ctx context.Context, namespace, name string) *Module {
+		m := &Module{}
+		m.Mesh = ContextValue[*Mesh](ctx, "mesh")
+
+		// TODO: load config from the mesh config store or Mesh.Modules
+
+		err := template(m)
+		if err != nil {
+			slog.Error("/ModInitError", "name", name, "err", err)
+		}
+		return m
+	})
 }
 
-func (mesh *Mesh) AddModule(m *Module) error {
-	return mesh.addModule(m, true)
-}
-func (mesh *Mesh) addModule(m *Module, started bool) error {
+func (mesh *Mesh) initConfiguredModule(m *Module) error {
 	parts := strings.Split(m.Name, "-")
 	protocol := parts[0]
 
@@ -121,28 +141,22 @@ func (mesh *Mesh) addModule(m *Module, started bool) error {
 
 	f := modInit[protocol]
 
-	if f == nil {
-		return errors.New("Not found " + m.Name)
-	}
 	m.Mesh = mesh
+
 	err := f(m)
 
-	if started {
-		if st, ok := m.Module.(Starter); ok {
-			err = st.Start(context.Background())
-			if err != nil {
-				return err
-			}
-		}
-	}
+	RegisterMod[*Module](DefaultContext, protocol, "", m.Name, m)
+
 	return err
 }
 
 // initModules will initialize all enabled components for this mesh.
+// MeshConfig embeds a list of configs, of Module type - the actual object
+// should be registered as AddKnownType to allow loading from config stores as well.
 //
 func (mesh *Mesh) initModules() error {
 	for n, md := range mesh.Modules {
-		err := mesh.addModule(md, false)
+		err := mesh.initConfiguredModule(md)
 		if err != nil {
 			slog.Warn("ModuleInit", "name", md.Name, "err", err, "n", n)
 		} else {
@@ -156,15 +170,28 @@ func (mesh *Mesh) Start(ctx context.Context) error {
 
 	mesh.initModules()
 
-	for _, md := range mesh.Modules {
+	// TODO: load dynamic modules (from K8S, files)
+	var err error
+	ModSeq2[*Module](ctx, func(s string, md *Module) bool {
 		if st, ok := md.Module.(Starter); ok {
-			err := st.Start(ctx)
+			err = st.Start(ctx)
 			if err != nil {
-				return err
+				log.Println("Failed to start", s, md, err)
+				return false
 			}
 		}
-	}
-	return nil
+		return true
+	})
+
+	//for _, md := range mesh.Modules {
+	//	if st, ok := md.Module.(Starter); ok {
+	//		err := st.Start(ctx)
+	//		if err != nil {
+	//			return err
+	//		}
+	//	}
+	//}
+	return err
 }
 
 func (mesh *Mesh) Close(ctx context.Context) error {
@@ -272,9 +299,111 @@ func FromEnv(ctx context.Context, cfg *MeshCfg, base string) (*Mesh, error) {
 	return ma, err
 }
 
-type InitFromEnv interface {
-	FromEnv(ctx context.Context, base string) error
+
+// Configurations for the mesh. Besides 'mesh identity' and authn/authz, dynamic config is a main feature of the
+// mesh.
+//
+// - JSON files in a base directory - this is included in this package.
+// - HTTP with mesh auth - TODO
+// - Yaml files - require adding a yaml parser ( and dependency )
+// - K8S or other plugins
+// - XDS - plugin.
+
+
+// FindConfig is a simple loader for a config file.
+func FindConfig(base string, out interface{}) error {
+	err := findConfigBase(base, out)
+	if err != nil {
+		return err
+	}
+
+	// Quick hack to load environment variables into the config struct.
+
+	// mapstructure package can also convert generic maps to structs - this is just minimal
+
+	envl := os.Environ()
+	envm := map[string]string{}
+	for _, k := range envl {
+		kv := strings.SplitN(k, "=", 2)
+		if len(kv) == 2 {
+			if strings.HasPrefix(kv[0], base) {
+				key := strings.TrimPrefix(kv[0], base)
+				envm[key] = kv[1]
+			}
+		}
+	}
+	envb, err := json.Marshal(envm)
+	if err != nil {
+		log.Println("Failed to overlay env", envl, err, envb)
+		return err
+	}
+
+	return json.Unmarshal(envb, out)
 }
+
+func findConfigBase(base string, out interface{}) error {
+	var data []byte =  nil
+
+	fb, err := os.ReadFile("./" + base + ".json")
+	if err == nil {
+		data = fb
+	} else {
+		fb, err = os.ReadFile("/" + base + "/" + base + ".json")
+		if err == nil {
+			data = fb
+		}
+	}
+
+	if data != nil {
+		err = json.Unmarshal(data, out)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if yu, ok := expvar.Get("/unmarshaller/yaml").(Unmarshaller); ok {
+		fb, err := os.ReadFile("./" + base + ".yaml")
+		if err == nil {
+			data = fb
+		} else {
+			fb, err = os.ReadFile("/" + base + "/" + base + ".yaml")
+			if err == nil {
+				data = fb
+			}
+		}
+		if data != nil {
+			err = yu.Unmarshal(data, out)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+		basecfg := os.Getenv(base)
+		if basecfg != "" {
+			data = []byte(basecfg)
+			err = yu.Unmarshal(data, out)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
+	basecfg := os.Getenv(base)
+	if basecfg != "" {
+		data = []byte(basecfg)
+		err = json.Unmarshal(data, out)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+
+	return nil
+}
+
 
 // FromEnv will initialize Mesh using local files and env variables.
 //
@@ -301,7 +430,7 @@ func (mesh *Mesh) FromEnv(ctx context.Context, base string) (error) {
 	// This should be unique, typically pod-xxx-yyy
 
 	// Merge a found config and env variables.
-	mesh.Get(base, cfg)
+	FindConfig(base, cfg)
 
 	if mesh.Name == "" {
 		name := os.Getenv("POD_NAME")

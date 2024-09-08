@@ -28,13 +28,13 @@ func TestCerts(t *testing.T) {
 	})
 
 	// SetCert the test CAs
-	ca := meshca.NewCA(nil)
+	ca := meshca.NewCA()
 	ca.Init("../../testdata/ca")
 	if ca.Private == nil {
 		t.Fatal("Failed to load CA")
 	}
 
-	cai := meshca.NewCA(nil)
+	cai := meshca.NewCA()
 	cai.Init("../../testdata/cluster1")
 
 	t.Run("SaveCerts", func(t *testing.T) {

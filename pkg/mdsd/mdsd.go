@@ -39,7 +39,7 @@ func SetupAgent(ma *meshauth.Mesh, mux *http.ServeMux) error {
 
 	mdsd := &MDSD{MeshAuth: ma}
 
-	ma.Get("mds", &mdsd.Metadata)
+	meshauth.FindConfig("mds", &mdsd.Metadata)
 	// Emulated MDS server
 	mux.HandleFunc("/computeMetadata/v1/", mdsd.HandleMDS)
 

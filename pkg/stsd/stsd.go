@@ -10,7 +10,7 @@ import (
 	"net/http"
 
 	"github.com/costinm/meshauth"
-	"github.com/costinm/meshauth/pkg/oidc"
+	"github.com/costinm/meshauth/pkg/tokens"
 )
 
 // TokenExchangeD is an OAuth2 token exchange server, RFC8694 -(extending RFC6749
@@ -24,7 +24,7 @@ import (
 //
 // It can returns access_token and JWT tokens.
 type TokenExchangeD struct {
-	Authn    *oidc.Authn
+	Authn    *tokens.Authn
 	Generate func(context.Context, *meshauth.JWT, string) (string, error)
 }
 
@@ -186,9 +186,9 @@ func (p *TokenExchangeD) generateSTSRespInner(token string) []byte {
 	//if err == nil {
 	//	expireInSec = int64(time.Until(exp).Seconds())
 	//}
-	stsRespParam := &meshauth.TokenResponse{
+	stsRespParam := &TokenResponse{
 		AccessToken:     token,
-		IssuedTokenType: meshauth.AccessTokenType,
+		IssuedTokenType: AccessTokenType,
 		TokenType:       "Bearer",
 		ExpiresIn:       expireInSec,
 	}
