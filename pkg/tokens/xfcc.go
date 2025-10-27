@@ -1,7 +1,5 @@
 package tokens
 
-import "strings"
-
 // WIP: Authenticate using Istio mTLS, for gRPC and HTTP
 // Not clear it has a future - using JWTs and mapping claims from cert to headers seem more
 // consistent and far simpler for users.
@@ -29,20 +27,20 @@ import "strings"
 // ParseXFCC is a minimal (and probably buggy) parser for XFCC
 // envoy header. It does not deal with quoted strings including
 // special chars (,;=). Istio certs are safe.
-func ParseXFCC(val string) map[string]string {
-	// Each element represents a proxy in the path
-	// We need the last one
-	elems := strings.Split(val, ",")
-
-	last := elems[len(elems)-1]
-
-	m := map[string]string{}
-	kvp := strings.Split(last, ";")
-	for _, v := range kvp {
-		// Note that values may include escaped quotes, and may be quoted if they include , or ;
-		// This is not used in istio
-		kv := strings.SplitN(v, "=", 2)
-		m[kv[0]] = kv[1]
-	}
-	return m
-}
+//func ParseXFCC(val string) map[string]string {
+//	// Each element represents a proxy in the path
+//	// We need the last one
+//	elems := strings.Split(val, ",")
+//
+//	last := elems[len(elems)-1]
+//
+//	m := map[string]string{}
+//	kvp := strings.Split(last, ";")
+//	for _, v := range kvp {
+//		// Note that values may include escaped quotes, and may be quoted if they include , or ;
+//		// This is not used in istio
+//		kv := strings.SplitN(v, "=", 2)
+//		m[kv[0]] = kv[1]
+//	}
+//	return m
+//}

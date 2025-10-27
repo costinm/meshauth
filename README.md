@@ -1,53 +1,101 @@
 # Minimal mesh-focused auth library
 
-This is an attempt to have a small, low-resource/WASM friendly library with no
-external dependencies encapsulating the most common mesh auth and provisioning patterns.
+This is an attempt to have a minimal, low-resource/WASM friendly library with no
+external dependencies encapsulating the most common mesh auth and 
+provisioning patterns.
 
-The code is in large part based on/forked from Istio and few of my projects, to remove dependencies  and keep a minimal package for native mesh integration.
-
-Provisioning and config are sometimes separated from auth - but it is safer and simpler
-and treat both as part of the 'security' layer. This package will attempt to bootstrap 
-config using environment-provided certificate and secrets and provides support 
-for config updates using signed messages.
-
+The code is in large part based on/forked from Istio and few of my projects,
+to remove dependencies  and extract the minimum required.
 
 ## Goals
 
-- minimal code - only auth features commonly used in mesh with no external dependency
-- minimal user config - auto-detect as much as possible from environment.
-- clean and commented interactions with external systems
-- support Spiffee, DNS and Matter IOT certificates
+- minimal code - only auth features commonly used in mesh, with no external dependency
+- provide common networking abstractions and platform adapters, but without 
+large dependencies and using a common model for gRPC/REST/K8S-REST.
 
-## Environment auto detection and configuration
+The platform and k8s integrations are focused on bootstraping and getting tokens.
 
-A mesh application may be deployed in multiple environments and requires a number
-of user-specific configs - trust domain, namespace, cluster names, etc. Setting it
-manually adds complexity to the helm/install charts, and is easy to get wrong with
-major negative impact. 
+## Config
+
+Provisioning and config are separated from 'mesh' - Istio is using gRPC/XDS, but
+ztunnel can also use a local config file. XDS is a big dependency, as is K8S
+client library.
+
+I am also more interested in signed configurations - where the transport doesn't
+matter and control plane is not trusted (zero-trust).
+
+Unlike Istio - 'on demand' is the only option. Pushing all configs (SOW) is possible,
+with the configs saved to disk (cached) and still loaded on demand.
 
 
-Istio automates this using injection - adding a number of volumes and environemnt 
-variables. While some names are istio specific and not ideal, it is a good starting
-point and can be gradually improved.
 
-Istio has evolved and has to maintain backward compat - a lot of the env variables
-are duplicated, redundant or not really needed in all cases. 
+## Certs and Tokens
 
-The current 'best practice' is to rely on a platform or CSI provider for client  
-certificates. In the absence of it, the app can authenticate using JWTs - it is possible
-to get them from TokenRequest (giving each service account permission to get tokens
-for itself), mounted tokens or platform metadata service. 
+It is my belief that 'certificates' and 'tokens' are about the same thing -
+signed claims, using JSON or DER format (or CBOR, etc). As such, every
+workload, every user, config providers are expected to have (at least) 
+one private key and to configure at least one trusted 'mesh root'.
 
-The certificate and JWTs encode namespace, trust domain, service account info - and 
-may include cluster and project info.
+Unlike Istio, the relation is very granular (and 'federated') - a workload may
+only trust the public key of the workload owner (whoever operates the workload
+and has platform permission to exec and run the code on the specific machine), 
+so each deployment and 'service account' can have a different root of trust.
 
-[Istio environment](docs/istio_env.md) lists all settings, only a subset will be
-required depending on the platform.
+Configs determine the signer for each destination - and may use different sources
+or mechanisms, including public CA infra, public DNS(SEC), private DNSSEC or any
+other mechanism appropriate for the service. The configs are either signed or
+retrieved from a trusted source (like a trusted control plane)
+
+### Certs
+
+The certs package has many helpers to work with certificates - including a
+CA, similar to Istio Citadel but minimized.
+
+The 'internet certificates' rely on 'certificate authorities', which have a huge
+power (can sign any domain). The Internet CAs have the 'isCA' bit set, and 
+verification of internet cert chains requires the isCA bit.
+
+However, a 'cert' without 'isCA' is still a claim, under the authority
+of the signer - just like a JWT issued by an IDP. The JWT provider is not 
+trusted for all identities on the internet - only for a domain. 
+
+Just like OIDC or ATproto bootstrap the trust for a FQDN by did:web or the
+'well known' public keys, a signing key for certificates associated with a domain
+can be configured or loaded.
+
+
+### Tokens
+
+This library includes very minimal code to parse/verify JWT and extract info.
+It is not complete or intended as a general library - just as a minimal one,
+focused for the tokens used in K8S/Istio - as well as Webpush VAPID tokens.
+
+It includes both verification and issuing/signing code. Like certificates, any 
+workload can sign 'claims'.
+
+
+## Webpush
+
+This package also include the basic primitives for using Webpush - crypto and VAPID. While webpush is primarily used for push messages to browsers, it is a very interesting mechanism for mesh config and events.
+
+## Packages
+
+- certs: utils around certificate signing, verification. Deps free.
+- tokens: utils around token signing, verification - including OIDC. Deps free.
+- webpush: encrypt/decrypt - VAPID is in tokens.
+- xnet: retry and network helpers.
+- meshauth(certs,tokens): Dest and common mesh properties.
+- uk8s(tokens,meshauth,xnet): utils around K8S tokens and raw access - not using K8S libs
+- ugcp(tokens,xnet,meshauth,xnet): utils around GCP integration (not using GCP libs) - MDS, STS, etc
+
 
 ### Environment and Defaults
 
-- Root certificates for mesh communication:  - 
-  /var/run/secrets/.... (platform provided roots), /etc/ssl/certs/ca-certificates.crt (Istio injected pods default), XDS_ROOT_CA, CA_ROOT_CA, system certificates. 
+
+The certs/JWT also include identity information that can be extracted - trust domain, namespace, etc.
+
+- Root certificates for mesh communication:  -
+  /var/run/secrets/.... (platform provided roots), /etc/ssl/certs/ca-certificates.crt (Istio injected pods default), XDS_ROOT_CA, CA_ROOT_CA, system certificates.
 
 - Workload identity: cert provisioned by CertManager, Istio, etc
 
@@ -58,100 +106,3 @@ required depending on the platform.
 - Pod name: POD_NAME, hostname
 
 - Service account: SERVICE_ACCOUNT, extracted from cert/JWT
-
-
-### Certificate provider
-
-In the absence of a 'platform certificate', the app should initiate 'commisioning'. 
-This is provided by separate libraries, since it depends on gRPC ( ligher versions
-also available for smaller binary size). 
-
-- Default is istiod.istio-system.svc:15012, using the JWT in ...
-- 
-
-# Integration
-
-Plugins:
-
-- discovery mechanisms for destination metadata (for example XDS).
-- certificate provisioning
-- transports
-
-## Certificates
-
-The code will lookup certificates in the locations used in Istio/GKE and
-generate certs for self-signed or testing. Includes the minimal CA
-code, similar to Citadel.
-
-## JWT
-
-This library includes very minimal code to parse/verify JWT and extract info.
-It is not complete or intended as a general library - just as a minimal one,
-focused for the tokens used in K8S/Istio.
-
-## Provisioning and bootstraping
-
-Mesh auth provisioning involves configuring a core set of options:
-
-- mesh and k8s root certificates
-- private key or JWT
-- a set of trusted servers for CA, XDS and further configuration.
-
-The certs/JWT also include identity information that can be extracted - trust domain, namespace, etc.
-
-## Webpush
-
-This package also include the basic primitives for using Webpush - crypto and VAPID. While webpush is primarily
-used for push messages to browsers, it is a very interesting mechanism for mesh config and events.
-
-## STS
-
-This is one of the more complicated pieces, getting google access tokens based on a
-GKE token.
-
-1. STS authentication starts with a GKE JWT with 'PROJECT.svc.id.goog' scope. You can mount it,
-   or get it in exchange for the default token.
-2. 'securetoken' API can exchange the token with a 'federated access token'
-   This token can be used by some services, including in IAM policy bindings.
-   In particular, it can be used with "workloadIdentiyUser" permission, to get tokens
-   for another GSA.
-3. Get token for a GSA, using https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s -
-   either generateAccessToken or generateIdToken
-
-It requires 3 round-trips, but can be cached and pre-fetched.
-
-The most important is the federated exchange, which requires a token with
-PROJECT_ID.svc.id.goog audience issued by a GKE cluster. Other IDP providers can
-be used as well - with an associated federation config.
-
-The federated token is a google access token associated with the 'foreign' K8S identity
-which can be used directly by some services, or exchanged with a regular GSA that allows
-delegation.
-
-```bash
-
-
-$ kubectl -n validation-temp-ns -c istio-proxy exec sleep-6758c4cb78-2gtpp -- \
-  cat /var/run/secrets/tokens/istio-token >  istio-token
-
-$ curl -v https://securetoken.googleapis.com/v1/identitybindingtoken -HContent-Type:application/json -d @exch.json
-
-
-{"audience":"identitynamespace:costin-istio.svc.id.goog:https://container.googleapis.com/v1/projects/costin-istio/locations/us-west1-c/clusters/istio-test",
-"subjectToken":"$(cat ISTIO_TOKEN)",
-"grantType":"urn:ietf:params:oauth:grant-type:token-exchange",
-"requestedTokenType":"urn:ietf:params:oauth:token-type:access_token",
-"scope":"https://www.googleapis.com/auth/cloud-platform",
-"subjectTokenType":"urn:ietf:params:oauth:token-type:jwt"}
-
-
-Response:
-{"access_token":"ya29.d.Ks...",
-"issued_token_type":"urn:ietf:params:oauth:token-type:access_token",
-"token_type":"Bearer",
-"expires_in":3600}
-
-
-
-```
-

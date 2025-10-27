@@ -22,6 +22,8 @@ import (
 	"time"
 )
 
+// extracted from GCP MDS code.
+
 const (
 	maxRetryAttempts = 5
 )

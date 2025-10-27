@@ -4,15 +4,29 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
-	"log"
 	"net"
 	"net/http"
 	"time"
-
-	"github.com/costinm/meshauth/pkg/apis/authn"
 )
 
+/*
+2025:
+
+- don't really need listeners - H2C and forwarding/handlers are good enough  abstractions, let ztunnel handle crypto and waypoint inbound rules, or
+  std libraries at h2c layer.
+
+- if dest is handled by istio or on secure net (wireguard, etc) - no crypto needed, no control plane. Use CIDR.
+
+- on-demand security info for workloads not handled by ztunnel/istio. DNS, well known, probes.
+
+- Dest is based on DestinationRule
+
+- model is L7 resources with K8S style of URLs.
+
+- L4 over H2 or SSH
+
+
+*/
 /*
 New model (2024):
 
@@ -37,22 +51,45 @@ can be Init balancers/waypoints or real endpoints. A host may have multiple IPs 
 From client perspective the main difference is that for Service we may get weights and localities
 and perform advanced client-side Init balancing and routing.
 
- */
+*/
 
+type Discoverer interface {
 
-// Dest represents a destination and associated security info.
+	// Discover will use configs, DNS, XDS, K8S or other means to find the properties of a destination.
+	// If none is found, the default is:
+	// - if addr is a general FQDN, use it as a standard internet destination.
+	// - if addr is a public IP - use the standard Dialer.
+	// - if addr has '.internal' or '.local' - use mesh root certificates and HBONE or SSH protocol.
+	// - for private IP ranges - same
+	//
+	// Custom Discover can set egress gateways or adjust.
+	Discover(ctx context.Context, addr string) (*Dest, error)
+}
+
+type ContextDialer interface {
+	// Dial with a context based on tls package - 'once successfully
+	// connected, any expiration of the context will not affect the
+	// connection'.
+	DialContext(ctx context.Context, net, addr string) (net.Conn, error)
+}
+
+// TokenSource is a common interface for anything returning Bearer or other kind of tokens.
+type TokenSource interface {
+	// GetToken for a given audience.
+	GetToken(context.Context, string) (string, error)
+}
+
+// Dest represents the metadata associated with an address.
 //
-// In Istio this is represented as DestinationRule, Envoy - Cluster, K8S Service (the backend side).
+// It is discovered from multiple sources - local config, control plane, DNS.
 //
 // This is primarily concerned with the security aspects (auth, transport),
 // and include 'trusted' attributes from K8S configs or JWT/cert.
 //
-// K8S clusters can be represented as a Dest - rest.Config Host is Addr, CACertPEM
-//
-// Unlike K8S and Envoy, the port is not required.
-//
-// This is part of the config - either static or on-demand. The key is the virtual
-// address or IP:port that is either captured or set as backendRef in routes.
+// K8S clusters can be represented as a Dest - rest.Config Host is Addr,
+// CACertPEM, same for all REST or gRPC services. For L7 destinations a HttpClient
+// and RoundTripper are created based on the metadata. This is required because
+// the Transport is associated with the trust configs.
 type Dest struct {
 
 	// Addr is the main (VIP or URL) address of the destination.
@@ -90,7 +127,7 @@ type Dest struct {
 	// GKE cluster: gke_PROJECT_LOCATION_NAME
 	//
 	// For mesh nodes:
-	// ID is the (best) primary id known for the node. Format is:
+	// Name is the (best) primary id known for the node. Format is:
 	//    base32(SHA256(EC_256_pub)) - 32 bytes binary, 52 bytes encoded
 	//    base32(ED_pub) - same size, for nodes with ED keys.
 	//
@@ -120,27 +157,21 @@ type Dest struct {
 	// ipfs://<CID>/<path>, ipns://<peer WorkloadID>/<path>, and dweb://<IPFS address>
 	//
 	// Multiaddr: TLV
-	ID string `json:"id,omitempty"`
 
+	// Name is the 'basename' or alias of the service.
+	//
+	Name string `json:"id,omitempty"`
 
-	// Sources of trust for validating the peer destination.
-	// Typically, a certificate - if not set, SYSTEM certificates will be used for non-mesh destinations
-	// and the MESH certificates for destinations using one of the mesh domains.
-	// If not set, the nodes' trust config is used.
-	TrustConfig *authn.TrustConfig `json:"trust,omitempty"`
+	// Domains are the DNS domains of the service.
+	// A service can be published in multiple DNS domains.
+	//Domain []string `json:"domains"`
 
-	// Expected SANs - if not set, the DNS host in the address is used.
-	// For mesh FQDNs, the namespace will be checked ( second part of the FQDN )
-	DNSSANs []string `json:"dns_san,omitempty"`
-	//IPSANs  []string `json:"ip_san,omitempty"`
-	URLSANs []string `json:"url_san,omitempty"`
-	// SNI to use when making the request. Defaults to hostname in Addr
-	SNI string `json:"sni,omitempty"`
+	// Identity required by this dest - if not set, inferred from JWT/cert
+	//Principal string
 
-	ALPN []string `json:"alpn,omitempty"`
-
-	// Location is set if the cluster has a default location (not global).
-	Location string `json:"location,omitempty"`
+	// Static token to use. May be a long lived K8S service account secret or other long-lived creds.
+	// Alternative: static token source
+	//Token string
 
 	// If empty, the cluster is using system certs or SPIFFE CAs - as configured in
 	// Mesh.
@@ -150,29 +181,13 @@ type Dest struct {
 	//
 	// TODO: allow root SHA only.
 	// TODO: move to trust config
-	CACertPEM []byte `json:"ca_cert,omitempty"`
+	CACertPEM string `json:"ca_cert,omitempty"`
 
-	// From CDS
-
-	// timeout for new network connections to endpoints in cluster
-	ConnectTimeout           time.Duration `json:"connect_timeout,omitempty"`
-	TCPKeepAlive             time.Duration `json:"tcp_keep_alive,omitempty"`
-	TCPUserTimeout           time.Duration `json:"tcp_user_timeout,omitempty"`
-	//MaxRequestsPerConnection int
-
-	// Default values for initial window size, initial window, max frame size
-	InitialConnWindowSize int32 `json:"initial_conn_window,omitempty"`
-	InitialWindowSize     int32 `json:"initial_window,omitempty"`
-	MaxFrameSize          uint32 `json:"max_frame_size,omitempty"`
-
-	Labels map[string]string `json:"labels,omitempty"`
-
-	// If set, this is required to verify the certs of dest if https is used
-	// If not set, system certs are used
-	roots *x509.CertPool `json:-`
-
-	// Credentials to use to authenticate to this destination.
-
+	// Sources of trust for validating the peer destination.
+	// Typically, a certificate - if not set, SYSTEM certificates will be used for non-mesh destinations
+	// and the MESH certificates for destinations using one of the mesh domains.
+	// If not set, the nodes' trust config is used.
+	// TrustConfig *tokens.TrustConfig `json:"trust,omitempty"`
 	// If set, Bearer tokens will be added.
 	TokenProvider TokenSource `json:-`
 
@@ -182,32 +197,35 @@ type Dest struct {
 	// In K8S - it will be the well-known token file.
 	TokenSource string `json:"tokens,omitempty"`
 
-	// WebpushPublicKey is the client's public key. From the getKey("p256dh") or keys.p256dh field.
-	// This is used for Dest that accepts messages encrypted using webpush spec, and may
-	// be used for validating self-signed destinations - this is expected to be the public
-	// key of the destination.
-	// Primary public key of the node.
-	// EC256: 65 bytes, uncompressed format
-	// RSA: DER
-	// ED25519: 32B
-	// Used for sending encryted webpush message
-	// If not known, will be populated after the connection.
-	WebpushPublicKey []byte `json:"pub,omitempty"`
+	// Location is set if the cluster has a default location (not global).
+	//Location string `json:"location,omitempty"`
 
-	// Webpush Auth is a secret shared with the peer, used in sending webpush
-	// messages.
-	WebpushAuth []byte `json:"auth,omitempty"`
-	// TLS-related settings
+	// timeout for new network connections to endpoints in cluster
+	//ConnectTimeout time.Duration `json:"connect_timeout,omitempty"`
+	//TCPKeepAlive   time.Duration `json:"tcp_keep_alive,omitempty"`
+	//TCPUserTimeout time.Duration `json:"tcp_user_timeout,omitempty"`
+	//MaxRequestsPerConnection int
+
+	// Default values for initial window size, initial window, max frame size
+	//InitialConnWindowSize int32  `json:"initial_conn_window,omitempty"`
+	//InitialWindowSize     int32  `json:"initial_window,omitempty"`
+	//MaxFrameSize          uint32 `json:"max_frame_size,omitempty"`
+
+	// Labels map[string]string `json:"labels,omitempty"`
+
+	// If set, this is required to verify the certs of dest if https is used
+	// If not set, system certs are used
+	// roots *x509.CertPool `json:-`
 
 	// Cached client
-	httpClient            *http.Client `json:-`
+	httpClient *http.Client `json:-`
 
 	// If set, the destination is using HTTP protocol - and this is the roundtripper to use.
 	// HttpClient() returns a http client initialized for this destination.
 	// For special cases ( reverse connections in h2r ) it will be a *http2.ClientConn.
 	//
-	RoundTripper            http.RoundTripper `json:-`
-	InsecureSkipTLSVerify bool `json:"insecure,omitempty"`
+	RoundTripper          http.RoundTripper `json:-`
+	InsecureSkipTLSVerify bool              `json:"insecure,omitempty"`
 
 	Dialer ContextDialer `json:-`
 
@@ -215,45 +233,70 @@ type Dest struct {
 	L4Secure bool `json:"l4secure,omitempty"`
 
 	// Last packet or registration from the peer.
-	LastSeen time.Time `json:"-"`
-
+	//LastSeen time.Time `json:"-"`
 
 	Backoff time.Duration `json:"-"`
-	Dynamic bool `json:"-"`
 
-	// Hosts are workload addresses associated with the backend service.
+	// Pods are workload addresses associated with the backend service.
+	// While the interface is not K8S specific, using the term since 'host'
+	// or 'node' or 'vm' are too generic and even more confusing.
 	//
 	// If empty, the MeshCluster Addr will be used directly - it is expected to be
 	// a FQDN or VIP that is routable - either a service backed by an LB or handled by
 	// ambient or K8S.
 	//
 	// This may be pre-configured or result of discovery (IPs, extra properties).
-	Hosts []*Host `json:"hosts,omitempty"`
+	//Hosts []*Pod `json:"pods,omitempty"`
 }
 
+/*
+  "Service" or "Virtual Host" or "load balancing" is a very different layer from
+  individual hostnames and pods.
 
-// Host represents the properties of a single workload.
+  Both use a FQDN, both have some cert verification and other similar options.
+  However, a Service is resolved to a set of 'Pods' and focused on proper weights
+  and load balancing.
+
+  So it seems better to have clear separation:
+  - a Pod is a container or VM running on a Host
+  - a Host is a physical machine (or VM) that runs Pods (containers or nested VMs),
+    and it has network connections, possibly public IPs.
+  - a Service is a FQDN that resolves to an virtual IP which is transparently mapped
+    to Pods, at L2 or L7 as a real gateway. Client has no control.
+  - a client LoadBalaner is a service like EDS that maps a FQDN to a stream of
+    weighted endpoints under client control.
+
+  The first 3 involve a FQDN resolved to (few) IPs - client uses an IP on same
+  network or can try all. Client doesn't know what the destination is.
+
+*/
+
+// Pod represents the properties of a single workload.
 // By default, clusters resolve the endpoints dynamically, using DNS or EDS or other
 // discovery mechanisms.
-type Host struct {
-	// Labels for the workload. Extracted from pod info - possibly TXT records
-	//
-	// 'hbone' can be used for a custom hbone endpoint (default 15008).
-	//
-	Labels map[string]string `json:"labels,omitempty"`
+//type Pod struct {
+//	// Labels for the workload. Extracted from pod info - possibly TXT records
+//	//
+//	// 'hbone' can be used for a custom hbone endpoint (default 15008).
+//	//
+//	Labels map[string]string `json:"labels,omitempty"`
+//
+//	//LBWeight int `json:"lb_weight,omitempty"`
+//	//Priority int
+//
+//	// Address is an IP where the host can be reached.
+//	// It can be a real IP (in the mesh, direct) or a jump host.
+//	//
+//	Address string `json:"addr,omitempty"`
+//	Via string `json:"via,omitempty"`
+//
+//	// FQDN of the host. Used to check host cert.
+//	Hostname string
+//}
 
-	//LBWeight int `json:"lb_weight,omitempty"`
-	//Priority int
-
-	// Address is an IP where the host can be reached.
-	// It can be a real IP (in the mesh, direct) or a jump host.
-	//
-	Address string `json:"addr,omitempty"`
-
-	// FQDN of the host. Used to check host cert.
-	Hostname string
+func (d *Dest) String() string {
+	return d.Addr
 }
-
 
 // HttpClient returns a http client configured to talk with this Dest using a secure connection.
 // - if CACertPEM is set, will be used instead of system
@@ -264,149 +307,62 @@ func (d *Dest) HttpClient() *http.Client {
 		return d.httpClient
 	}
 
-	if d.L4Secure {
-		d.httpClient = &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-			},
-		}
-	} else {
-		tlsConfig := &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: d.InsecureSkipTLSVerify,
-		}
-
-		if len(d.CACertPEM) != 0 {
-			tlsConfig.RootCAs = x509.NewCertPool()
-			if !tlsConfig.RootCAs.AppendCertsFromPEM(d.CACertPEM) {
-				return nil //, errors.New("certificate authority doesn't contain any certificates")
-			}
-		}
-
-		d.httpClient = &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
-			},
-		}
+	t := &http.Transport{}
+	d.httpClient = &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: t,
 	}
 
+	if d.L4Secure {
+		//h.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		//	var d net.Dialer
+		//	return d.DialContext(ctx, network, addr)
+		//}
+
+		// Replaces:
+		//&http.Client{
+		//	Transport: &http2.Transport{
+		//		AllowHTTP: true,
+		//		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		//			var d net.Dialer
+		//			return d.DialContext(ctx, network, addr)
+		//		},
+		//	},
+		//
+		//h.ReadIdleTimeout = 10000 * time.Second
+		//h.StrictMaxConcurrentStreams = false
+
+		t.Protocols = new(http.Protocols)
+		t.Protocols.SetUnencryptedHTTP2(true)
+		t.Protocols.SetHTTP1(true)
+	} else if d.InsecureSkipTLSVerify {
+		t.TLSClientConfig = &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		}
+	} else if len(d.CACertPEM) != 0 {
+		certPool := x509.NewCertPool()
+		certPool.AppendCertsFromPEM([]byte(d.CACertPEM))
+		t.TLSClientConfig.RootCAs = certPool
+	}
 
 	return d.httpClient
 }
 
+//func (d *Dest) DialContext(ctx context.Context, net, addr string) (net.Conn, error) {
+//	// H2 dial or regular dial using a tunnel
+//	return nil, nil
+//}
 
 func (d *Dest) RoundTrip(r *http.Request) (*http.Response, error) {
 	return d.HttpClient().Do(r)
 }
 
-// WIP
-func (d *Dest) DialTLS(a *Mesh, nc net.Conn) (*tls.Conn, error) {
-	tlsClientConfig := a.TLSClientConf(d, d.SNI, d.Addr)
-	tlsTun := tls.Client(nc, tlsClientConfig)
-	ctx, cf := context.WithTimeout(context.Background(), 3 * time.Second)
-	defer cf()
-
-	err := tlsTun.HandshakeContext(ctx)
-
-	if err != nil {
-		return nil, err
-	}
-	return tlsTun, nil
-}
-
 // TODO: add a DialTLSContext using DNS-SEC for Cert SHA, as well as a direct CERT-SHA
-
-func (d *Dest) GetCACertPEM() []byte {
-	return d.CACertPEM
-}
-
-// AddToken will add a token to the request, using the 'token source' of the
-// destination.
-func (d *Dest) AddToken(ma *Mesh, req *http.Request, aut string) error {
-	if d.TokenSource != "" {
-		tp := ma.AuthProviders[d.TokenSource]
-		if tp != nil {
-			t, err := tp.GetToken(req.Context(), aut)
-			if err != nil {
-				return err
-			}
-			req.Header.Add("authorization", "Bearer "+t)
-		}
-	}
-	if d.TokenProvider != nil {
-		t, err := d.TokenProvider.GetToken(req.Context(), aut)
-		if err != nil {
-			return err
-		}
-		req.Header.Add("authorization", "Bearer "+t)
-		//for k, v := range t {
-		//	req.Header.Add(k, v)
-		//}
-	}
-
-	// TODO: use default workload identity token source for Mesh
-
-	return nil
-}
-
-func (d *Dest) TokenGetter(m *Mesh) TokenSource {
-	return TokenSourceFunc(func(ctx context.Context, aut string) (string, error) {
-		if d.TokenSource != "" {
-			tp := m.AuthProviders[d.TokenSource]
-			if tp != nil {
-				t, err := tp.GetToken(ctx, aut)
-				if err != nil {
-					return "", err
-				}
-				return t, nil
-			}
-		}
-		if d.TokenProvider != nil {
-			t, err := d.TokenProvider.GetToken(ctx, aut)
-			if err != nil {
-				return "", err
-			}
-			return t, nil
-		}
-
-		// TODO: use default workload identity token source for Mesh
-		return "", nil
-	})
-}
-
-func (d *Dest) CertPool() *x509.CertPool {
-	if d.roots == nil {
-		d.roots = x509.NewCertPool()
-		if d.CACertPEM != nil {
-			ok := d.roots.AppendCertsFromPEM(d.CACertPEM)
-			if !ok {
-				log.Println("Failed to parse CACertPEM", "addr", d.Addr)
-			}
-		}
-	}
-	return d.roots
-}
-
-func (d *Dest) AddCACertPEM(pems []byte) error {
-	if d.roots == nil {
-		d.roots = x509.NewCertPool()
-	}
-	if d.CACertPEM != nil {
-		d.CACertPEM = append(d.CACertPEM, '\n')
-		d.CACertPEM = append(d.CACertPEM, pems...)
-	} else {
-		d.CACertPEM = pems
-	}
-	if !d.roots.AppendCertsFromPEM(pems) {
-		return errors.New("Failed to decode PEM")
-	}
-	return nil
-}
 
 // Helpers for making REST and K8S requests for a k8s-like API.
 
-
+// BackoffReset and Sleep implement the backoff interface
 func (d *Dest) BackoffReset() {
 	d.Backoff = 0
 }
@@ -421,72 +377,10 @@ func (d *Dest) BackoffSleep() {
 	}
 }
 
-
-// GetDest returns a cluster for the given address, or nil if not found.
-func (mesh *Mesh) GetDest(addr string) *Dest {
-	mesh.m.RLock()
-	c := mesh.Dst[addr]
-	// Make sure it is set correctly.
-	if c != nil && c.ID == "" {
-		c.ID = addr
-	}
-
-	mesh.m.RUnlock()
-	return c
-}
-
-
-// Cluster will get an existing cluster or create a dynamic one.
-// Dynamic clusters can be GC and loaded on-demand.
-func (mesh *Mesh) GetOrAddDest(ctx context.Context, addr string) (*Dest, error) {
-	// TODO: extract cluster from addr, allow URL with params to indicate how to connect.
-	//host := ""
-	//if strings.Contains(dest, "//") {
-	//	u, _ := url.Parse(dest)
-	//
-	//	host, _, _ = net.SplitHostPort(u.Host)
-	//} else {
-	//	host, _, _ = net.SplitHostPort(dest)
+func (d *Dest) AddTrustPEM(c []byte) {
+	//if d.Trust == nil {
+	//	d.Trust = certs.Trust{}
 	//}
-	//if strings.HasSuffix(host, ".svc") {
-	//	hc.H2Gate = hg + ":15008" // hbone/mtls
-	//	hc.ExternalMTLSConfig = auth.GenerateTLSConfigServer()
-	//}
-	//// Initialization done - starting the proxy either on a listener or stdin.
+	d.CACertPEM = string(c)
 
-	// 1. Find the cluster for the address. If not found, create one with the defaults or use on-demand
-	// if XDS server is configured
-	mesh.m.RLock()
-	c, ok := mesh.Dst[addr]
-	mesh.m.RUnlock()
-
-	// TODO: use discovery to find info about service addr, populate from XDS on-demand or DNS
-	if !ok {
-		// TODO: on-demand, DNS lookups, etc
-		c = &Dest{Addr: addr, Dynamic: true, ID: addr}
-		mesh.addDest(c)
-	}
-	//c.LastUsed = time.Now()
-	return c, nil
-}
-
-// addDest will add a cluster to be used for Dial and RoundTrip.
-// The 'Addr' field can be a host:port or IP:port.
-// If id is set, it can be host:port or hostname - will be added as a destination.
-// The service can be IP:port or URLs
-func (mesh *Mesh) addDest(c *Dest) *Dest {
-	mesh.m.Lock()
-	mesh.Dst[c.Addr] = c
-
-	if c.ID != "" {
-		mesh.Dst[c.ID] = c
-	}
-
-	//c.UGate = hb
-	//if c.ConnectTimeout == 0 {
-	//	c.ConnectTimeout = hb.Auth.ConnectTimeout.Duration
-	//}
-	mesh.m.Unlock()
-
-	return c
 }

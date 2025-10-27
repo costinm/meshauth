@@ -1,0 +1,4 @@
+{
+  "domain": "test.mesh.local",
+  "allow_namespaces": ["alicens"]
+}

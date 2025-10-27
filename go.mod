@@ -1,6 +1,6 @@
 module github.com/costinm/meshauth
 
-go 1.22.2
+go 1.24
 
 // Keep it dependency free
 

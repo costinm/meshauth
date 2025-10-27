@@ -8,9 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base32"
 	"encoding/base64"
@@ -18,9 +16,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"log"
-	"math/big"
-	"time"
+	"net/http"
 )
 
 func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
@@ -35,60 +31,6 @@ func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
 	}
 
 	return nil
-}
-
-func SignCert(priv crypto.PrivateKey, ca crypto.PrivateKey, org string, sans ...string) (tls.Certificate, []byte, []byte) {
-	pub := PublicKey(priv)
-	certDER := SignCertDER(pub, ca, org, sans...)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	ecb, _ := x509.MarshalPKCS8PrivateKey(priv)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: ecb})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		log.Println("Error generating cert ", err)
-	}
-	return tlsCert, keyPEM, certPEM
-}
-
-func SignCertDER(pub crypto.PublicKey, caPrivate crypto.PrivateKey, org string, sans ...string) []byte {
-	var notBefore time.Time
-	notBefore = time.Now().Add(-1 * time.Hour)
-
-	notAfter := notBefore.Add(365 * 24 * time.Hour)
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName:   sans[0],
-			Organization: []string{org},
-		},
-		NotBefore: notBefore,
-		NotAfter:  notAfter,
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              sans,
-		//IPAddresses:           []net.IP{auth.VIP6},
-	}
-	// IPFS:
-	//certKeyPub, err := x509.MarshalPKIXPublicKey(certKey.Public())
-	//signature, err := sk.Sign(append([]byte(certificatePrefix), certKeyPub...))
-	//value, err := asn1.Marshal(signedKey{
-	//	PubKey:    keyBytes,
-	//	Signature: signature,
-	//})
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, caPrivate)
-	if err != nil {
-		panic(err)
-	}
-	return certDER
 }
 
 
@@ -110,8 +52,8 @@ const (
 	nameTypeIP    = 7
 )
 
-// MarshalPrivateKey returns the PEM encoding of the key
-func MarshalPrivateKey(priv crypto.PrivateKey) []byte {
+// MarshalPrivateKeyPEM returns the PEM encoding of the key
+func MarshalPrivateKeyPEM(priv crypto.PrivateKey) []byte {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		encodedKey := x509.MarshalPKCS1PrivateKey(k)
@@ -149,6 +91,19 @@ func GenerateKey(kty string) crypto.PrivateKey {
 	privk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 
 	return privk
+}
+
+func GetSANRequest(req *http.Request) ([]string, error) {
+	tls := req.TLS
+	if tls != nil && len(tls.PeerCertificates) > 0 {
+		// pk1 := tls.PeerCertificates[0].PublicKey
+
+		// RemoteID = certs.PublicKeyBase32SHA(pk1)
+		// TODO: Istio-style, signed by a trusted CA. This is also for SSH-with-cert
+		sans, err := GetSAN(tls.PeerCertificates[0])
+		return sans, err
+	}
+	return nil, nil
 }
 
 func GetSAN(c *x509.Certificate) ([]string, error) {
@@ -342,3 +297,29 @@ func IDFromCert(c []*x509.Certificate) string {
 	}
 	return base32Enc.EncodeToString(m)
 }
+
+// PublicKeyBase32SHA returns a node WorkloadID based on the
+// public key of the node - 52 bytes base32 for EC256 keys
+func PublicKeyBase32SHA(key crypto.PublicKey) string {
+	m := MarshalPublicKey(key)
+	if len(m) > 32 {
+		sha256 := sha256.New()
+		sha256.Write(m)
+		m = sha256.Sum([]byte{}) // 302
+	}
+	// ED key is sent as-is
+	return base32Enc.EncodeToString(m)
+}
+
+func RawToCertChain(rawCerts [][]byte) ([]*x509.Certificate, error) {
+	chain := make([]*x509.Certificate, len(rawCerts))
+	for i := 0; i < len(rawCerts); i++ {
+		cert, err := x509.ParseCertificate(rawCerts[i])
+		if err != nil {
+			return nil, err
+		}
+		chain[i] = cert
+	}
+	return chain, nil
+}
+
